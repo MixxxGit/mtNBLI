@@ -1,0 +1,18 @@
+# build products
+/mtnbli
+/mtnbli_native
+*.o
+*.a
+/tests/quick_test
+/tests/enc_test
+
+# fuzzing / test leftovers
+core.*
+tests/__pycache__/
+__pycache__/
+*.pyc
+
+# editor / OS junk
+*~
+*.swp
+.DS_Store
