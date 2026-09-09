@@ -107,6 +107,15 @@ coder kicks in. Measured on the 6000×4000 image above (untiled baseline: 11 739
 Up to about 16 tiles the cost is negligible. `-T 0` (auto) picks `2 × n_threads`, clamped so that
 no strip is shorter than 96 rows.
 
+Two things to keep in mind:
+
+* the tile count is **baked in at compression time** — a `.tnbli` with 8 tiles can never use more
+  than 8 cores, however big the machine that later decodes it. If you compress on a small box and
+  decode on a big one, pass `-T` explicitly.
+* `-t` defaults to `min(CPUs you have, CPUs your cgroup lets you burn)`, reading the CFS quota
+  from `/sys/fs/cgroup/cpu.max`. Oversubscribing a throttled container is measurably slower, not
+  just useless (see §7.3).
+
 ## 4. Portable AVX2 emulation
 
 The fNBLI encoder uses a 16-lane diagonal wave-front coder when the image is large
@@ -183,38 +192,68 @@ $ python3 tests/corpus_check.py /workspace/corpus mtnbli ../NBLI/fNBLI ../NBLI/N
   21 passed, 0 failed, 0 skipped
 ```
 
-## 7. Performance
+## 7. Performance — what parallelises and what does not
 
-`tests/bench.sh <image> [tiles] [thread list]` prints a scaling table.
+This is the part people get wrong, so it comes with numbers. `mtnbli` **decodes both formats
+bit-exactly**, but the two formats are *not* equally parallelisable:
 
-**6000×4000 RGB (72 MB), 16 tiles** — Intel Xeon Platinum 8576C, 32 hardware threads:
+| workload | fNBLI | NBLI | parallel? |
+|---|---|---|---|
+| **one** legacy `.fnbli` / `.nbli` file | yes | yes | **no — 1 core, always** |
+| **many** files in one invocation | yes | yes | **yes** |
+| **one** `.tnbli` file (tiled) | yes | yes | **yes** |
+
+A legacy stream is one adaptive rANS/Golomb stream: symbol *N* needs the complete coder state
+left behind by symbols *0..N-1*. That is a serial dependency, not an implementation detail — so
+**no decoder, however clever, can make a single legacy file use two cores.** Measured, one
+800×600 file, best of 3:
+
+| threads | 1 | 8 | 32 |
+|---|---:|---:|---:|
+| one `.fnbli` | 0.046 s | 0.045 s | 0.046 s |
+| one `.nbli`  | 0.092 s | 0.092 s | 0.093 s |
+
+Flat. Threads change nothing. Everything below is about the two cases that *do* scale.
+
+### 7.1 Many files at once (both formats, no re-encoding needed)
+
+16 legacy 800×600 streams in a single invocation, best of 3:
+
+| | `-t 1` | `-t 8` | speed-up |
+|---|---:|---:|---:|
+| 16 × `.fnbli` | 0.805 s | 0.160 s | **5.0×** |
+| 16 × `.nbli`  | 1.500 s | 0.370 s | **4.1×** |
+
+This is the mode to use for an existing archive: `mtnbli -f *.fnbli *.nbli` and all cores are busy.
+
+### 7.2 One big file — needs the `.tnbli` container
+
+`tests/bench.sh <image> [tiles] [thread list]` prints the table. 3000×2000 RGB (18 MB), 12 tiles:
 
 | threads | compress | speed-up | decompress | speed-up | size |
 |---:|---:|---:|---:|---:|---:|
-| 1  | 2.023 s | 1.00× | 1.665 s | 1.00× | 11 758 142 |
-| 2  | 1.032 s | 1.96× | 0.854 s | 1.95× | 11 758 142 |
-| 3  | 0.785 s | 2.58× | 0.631 s | 2.64× | 11 758 142 |
-| 4  | 0.559 s | 3.62× | 0.438 s | 3.80× | 11 758 142 |
-| 6  | 0.530 s | 3.82× | 0.447 s | 3.72× | 11 758 142 |
-| 8  | 0.540 s | 3.75× | 0.409 s | 4.07× | 11 758 142 |
-| 16 | 0.621 s | 3.26× | 0.436 s | 3.82× | 11 758 142 |
-
-**2000×2000 RGB (12 MB), 16 tiles** — the working set now fits, and the picture changes:
-
-| threads | compress | speed-up | decompress | speed-up |
-|---:|---:|---:|---:|---:|
-| 1  | 0.357 s | 1.00× | 0.298 s | 1.00× |
-| 2  | 0.186 s | 1.92× | 0.161 s | 1.85× |
-| 4  | 0.098 s | 3.64× | 0.079 s | 3.77× |
-| 8  | 0.061 s | 5.85× | 0.072 s | 4.14× |
-| 16 | 0.072 s | 4.96× | 0.039 s | 7.64× |
-
-The plateau on the 72 MB image is **memory bandwidth**, not the codec (a 72 MB image is written
-and read once per pass); with a cache-resident image the decoder still reaches 7.6× at 16 threads.
-On a 6-core Phenom II the codec sits squarely in the 3.5–4× region — which is the whole point.
+| 1  | 0.522 s | 1.00× | 0.430 s | 1.00× | 3 423 332 |
+| 2  | 0.270 s | 1.93× | 0.222 s | 1.94× | 3 423 332 |
+| 3  | 0.195 s | 2.68× | 0.150 s | 2.87× | 3 423 332 |
+| 4  | 0.151 s | 3.46× | 0.115 s | 3.74× | 3 423 332 |
+| 6  | 0.133 s | 3.92× | 0.101 s | 4.26× | 3 423 332 |
+| 8  | 0.113 s | 4.62× | 0.103 s | 4.17× | 3 423 332 |
+| 16 | 0.068 s | 7.68× | 0.106 s | 4.06× | 3 423 332 |
 
 The produced image is **bit-identical regardless of the thread count** (verified for
 `-t 1 / 3 / 6 / 32`).
+
+### 7.3 Caveat about these numbers
+
+The machine that produced them reports 32 CPUs but runs under a CFS quota of **4.00 CPU**
+(`/sys/fs/cgroup/cpu.max = 400000 100000`). Speed-ups therefore saturate around 4–5×, and pushing
+far past the quota is *counter-productive*: in the 16-file batch, `-t 8` took 0.341 s but
+`-t 16` took 0.439 s and `-t 32` 0.459 s, because the cgroup gets throttled and pays for extra
+context switches. `tests/bench.sh` detects the quota and says so in its header — do not read a
+table as "the codec stops scaling" without checking that line first.
+
+On real, unthrottled hardware expect the scaling to continue to the physical core count. On a
+6-core Phenom II X6 that means roughly 5–6× on a `.tnbli` and on batches.
 
 ## 8. Source layout
 

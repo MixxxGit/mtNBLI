@@ -25,6 +25,22 @@ H=$(head -c 200 "$IMG" | tr -s ' \n' ' ' | cut -d' ' -f3)
 BPP=$(stat -c%s "$IMG")
 echo "image : $IMG   ${W}x${H}   $((BPP/1000000)) MB"
 echo "tiles : $TILES"
+
+# how many CPUs can this process REALLY use?  nproc lies inside a container with a CFS quota,
+# and a table that saturates at the quota says nothing about the codec.
+n_cpu=$($MT 2>&1 | sed -n 's/.*default: all \([0-9]*\) hardware.*/\1/p')
+n_cpu=${n_cpu:-$(nproc)}
+quota=""
+for f in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/cpu/cpu.cfs_quota_us; do [ -r "$f" ] && quota=$(cat "$f"); done
+eff=""
+if [ -n "$quota" ]; then
+    set -- $quota
+    q=$1; p=${2:-100000}
+    if [ "$q" != "-1" ] && [ "$q" != "max" ] && [ "$p" -gt 0 ]; then
+        eff=$(python3 -c "print('%.2f'%($q/$p))")
+    fi
+fi
+echo "cpus  : $n_cpu visible${eff:+, but the cgroup quota is $eff CPU -> speed-ups above that are pointless}"
 echo
 
 printf "%-8s %12s %8s %14s %12s %8s\n" "threads" "compress" "speedup" "decompress" "speedup" "bytes"
