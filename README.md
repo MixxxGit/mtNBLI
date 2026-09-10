@@ -29,6 +29,15 @@ make isa        # verify the binary contains no forbidden instruction
 Only `g++`/`gcc` and `make` are needed (C++11). No external libraries: the PNG reader
 (uPNG) and the PNM reader are vendored.
 
+**Prebuilt binaries** ([v0.4-mt2](https://github.com/MixxxGit/mtNBLI/releases/tag/v0.4-mt2),
+built by GitHub Actions, both with the portable ISA):
+
+```
+mtnbli-linux-x86_64     390 456 bytes   - any x86-64 Linux (glibc 2.35+)
+mtnbli-win64.exe      1 217 929 bytes   - Windows 10 / 11 (and XP x64), statically linked
+SHA256SUMS.txt
+```
+
 `make isa` disassembles the binary and greps the mnemonic list for anything belonging to
 SSSE3 / SSE4.1 / SSE4.2 / AVX / AVX2 / BMI / BMI2 / FMA / POPCNT / LZCNT / AES / PCLMUL /
 MOVBE / CRC32. The default build passes it — the highest SIMD level it uses is baseline SSE2.
