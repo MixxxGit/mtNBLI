@@ -1,7 +1,9 @@
 # build products
 /mtnbli
 /mtnbli_native
+/mtnbli.exe
 *.o
+*.w.o
 *.a
 /tests/quick_test
 /tests/enc_test

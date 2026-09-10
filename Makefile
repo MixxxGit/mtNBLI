@@ -32,7 +32,19 @@ OBJ      := $(OBJ_CXX) $(OBJ_C)
 
 BIN      := mtnbli
 
-.PHONY: all native clean test isa help
+#--------------------------------------------------------------------------- Windows cross build
+#  needs  apt-get install mingw-w64   (or any x86_64-w64-mingw32 toolchain)
+#  Produces a statically linked mtnbli.exe with no DLL dependencies beyond the Windows ones,
+#  and with the same "no SSE4 / no AVX" restriction as the portable Linux build.
+WINCXX  ?= x86_64-w64-mingw32-g++
+WINCC   ?= x86_64-w64-mingw32-gcc
+WINBIN  ?= mtnbli.exe
+WINOBJ  := $(SRC_CXX:%.cpp=%.w.o) $(SRC_C:%.c=%.w.o)
+WINFLAGS = -O3 -std=c++11 -fno-strict-aliasing $(PORT_ISA) $(WARN) $(INC) \
+           -static -static-libgcc -static-libstdc++
+WINCFLAGS = -O2 -std=gnu99 $(PORT_ISA) -w $(INC)
+
+.PHONY: all native clean test isa win64 win64-isa win64-check help
 
 all: $(BIN)
 
@@ -44,6 +56,27 @@ test: $(BIN)
 # prove that the binary contains no instruction a Phenom II does not have
 isa: $(BIN)
 	@./tests/isa_check.sh
+
+# cross compile a Windows x86-64 .exe with the same portable ISA
+win64: $(WINBIN)
+
+$(WINBIN): $(WINOBJ)
+	$(WINCXX) $(WINFLAGS) -o $@ $(WINOBJ) -static -static-libgcc -static-libstdc++ -lpthread
+	@echo "  built $@  (portable ISA, Windows x86-64)"
+
+%.w.o: %.cpp
+	$(WINCXX) $(WINFLAGS) -c -o $@ $<
+
+%.w.o: %.c
+	$(WINCC) $(WINCFLAGS) -c -o $@ $<
+
+# verify the Windows build too (isa_check.sh understands PE files via the mingw objdump)
+win64-isa: $(WINBIN)
+	@./tests/isa_check.sh $(WINBIN)
+
+# run the .exe under wine and compare its output with the native build (skipped if wine is absent)
+win64-check: $(WINBIN) $(BIN)
+	@./tests/win_check.sh
 
 $(BIN): $(OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJ) $(LDFLAGS)
@@ -74,7 +107,8 @@ tests/enc_test: tests/enc_test.cpp src/fnbli_scalar.h src/fnbli_api.h
 	$(CXX) $(CXXFLAGS) $(INC) -Isrc/imageio -o $@ tests/enc_test.cpp src/imageio/imageio_pnm.c
 
 clean:
-	rm -f $(OBJ) $(BIN) $(BIN)_native tests/quick_test tests/enc_test
+	rm -f $(OBJ) $(WINOBJ) $(BIN) $(BIN)_native $(WINBIN) tests/quick_test tests/enc_test
 
 help:
 	@echo "targets:  all (default, portable ISA) | native (-march=native) | test | isa | clean"
+	@echo "          win64 | win64-isa | win64-check   (cross compile mtnbli.exe, needs mingw-w64)"

@@ -23,6 +23,15 @@
 #include <chrono>
 #include <thread>
 
+#ifdef _WIN32
+#  define  WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+// windef.h still defines the 16-bit era 'near' / 'far' macros, and 'near' is the name of the
+// NBLI distortion parameter.  They are empty and useless, drop them.
+#  undef   near
+#  undef   far
+#endif
+
 #include "FileIO.h"
 #include "CRC32.h"
 #include "safedecode.h"
@@ -102,6 +111,22 @@ inline static std::string replaceFileSuffix (const char *p_src, const char *p_su
 // name of the CPU we are running on (only for the banner)
 static std::string cpuName () {
     std::string r;
+
+#ifdef _WIN32
+    // HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0\ProcessorNameString
+    {
+        HKEY hk = NULL;
+        if (RegOpenKeyExA (HKEY_LOCAL_MACHINE,
+                           "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                           0, KEY_READ, &hk) == ERROR_SUCCESS) {
+            char  buf[256] = {0};
+            DWORD sz = sizeof(buf), ty = 0;
+            if (RegQueryValueExA (hk, "ProcessorNameString", NULL, &ty, (LPBYTE) buf, &sz) == ERROR_SUCCESS)
+                r = buf;
+            RegCloseKey (hk);
+        }
+    }
+#else
     FILE *fp = fopen ("/proc/cpuinfo", "r");
     if (fp) {
         char line[512];
@@ -118,6 +143,8 @@ static std::string cpuName () {
         }
         fclose (fp);
     }
+#endif
+
 #if defined(__x86_64__) && defined(__GNUC__)
     __builtin_cpu_init ();
     r += __builtin_cpu_supports ("avx2") ? "   (AVX2: yes)" : "   (AVX2: NO)";
@@ -125,6 +152,40 @@ static std::string cpuName () {
     if (r.empty()) r = "unknown";
     if (r.size() > 71) r = r.substr (0, 71);
     return r;
+}
+
+//-------------------------------------------------------------------------------------------------- integer fixed point formatting
+//  v is expected to be finite and non-negative; anything else prints as "0".
+static const unsigned long long *g_pow10 = NULL;
+
+static void fmt_init () {
+    static unsigned long long p [10];
+    p[0] = 1;
+    for (int i=1; i<10; i++) p[i] = p[i-1] * 10ull;
+    g_pow10 = p;
+}
+
+// appends "int.frac" with exactly 'dec' fraction digits (no locale, no floats in the binary)
+static void fmt_fixed (std::string &s, double v, int dec) {
+    if (!(v > 0) || v > 1e15) { s += (dec > 0) ? "0." : "0"; for (int i=0; i<dec; i++) s += '0'; return; }
+    unsigned long long ip = (unsigned long long) v;
+    double rest = v - (double) ip;
+    unsigned long long fr = (unsigned long long) (rest * (double) g_pow10[dec] + 0.5);
+    if (fr >= g_pow10[dec]) { fr -= g_pow10[dec]; ip++; }        // rounding carried
+    char buf [64];
+    snprintf (buf, sizeof(buf), "%llu", ip);
+    s += buf;
+    if (dec > 0) {
+        s += '.';
+        snprintf (buf, sizeof(buf), "%0*llu", dec, fr);
+        s += buf;
+    }
+}
+
+static void fmt_rate (std::string &s, double kBps) {             // "12345 kB/s"
+    char buf [64];
+    snprintf (buf, sizeof(buf), "%llu", (!(kBps > 0) || kBps > 1e15) ? 0ull : (unsigned long long)(kBps + 0.5));
+    s += buf;
 }
 
 static double nowSec () {
@@ -562,6 +623,11 @@ int main (int argc, char **argv)
     double t_all = nowSec() - t_all0;
 
     // ---------------- report
+    // The numbers are formatted by hand with integer arithmetic and NOT with printf("%f"):
+    // %f drags the C library's float -> string converter (gdtoa) into the binary, and mingw's
+    // copy of it is built with BMI enabled, so the .exe would contain a TZCNT -- an instruction
+    // a Phenom II does not have.  See tests/isa_check.sh.
+    fmt_init ();
     int n_comp=0, n_dec=0, n_fail=0;
     for (size_t i=0; i<jobs.size(); i++) {
         Job &j = jobs[i];
@@ -571,15 +637,19 @@ int main (int argc, char **argv)
             if (!j.ok) {
                 printf ("*** FAILED : %s\n", j.note.c_str());
             } else if (j.kind == 0) {
-                printf ("(%ux%u) -> %llu bytes  BPP=%.5f  %.4f s  %.0f kB/s%s%s\n",
-                        j.w, j.h, (unsigned long long)j.bytes,
-                        (8.0*(double)j.bytes) / ((double)j.w*j.h), j.secs + 1e-9,
-                        (0.001*(double)((size_t)j.w*j.h*3)) / (j.secs + 1e-9),
+                std::string n;
+                fmt_fixed (n, (8.0*(double)j.bytes) / ((double)j.w*j.h), 5);  n += "  ";
+                fmt_fixed (n, j.secs + 1e-9, 4);                              n += " s  ";
+                fmt_rate  (n, (0.001*(double)((size_t)j.w*j.h*3)) / (j.secs + 1e-9)); n += " kB/s";
+                printf ("(%ux%u) -> %llu bytes  BPP=%s%s%s\n",
+                        j.w, j.h, (unsigned long long)j.bytes, n.c_str(),
                         j.crc ? "  CRC" : "", "");
             } else {
-                printf ("(%llu bytes) -> %ux%u  %.4f s  %.0f kB/s%s\n",
-                        (unsigned long long)j.bytes, j.w, j.h, j.secs + 1e-9,
-                        (0.001*(double)((size_t)j.w*j.h*3)) / (j.secs + 1e-9),
+                std::string n;
+                fmt_fixed (n, j.secs + 1e-9, 4);                              n += " s  ";
+                fmt_rate  (n, (0.001*(double)((size_t)j.w*j.h*3)) / (j.secs + 1e-9)); n += " kB/s";
+                printf ("(%llu bytes) -> %ux%u  %s%s\n",
+                        (unsigned long long)j.bytes, j.w, j.h, n.c_str(),
                         j.crc ? "  CRC OK" : "");
             }
             fflush (stdout);
@@ -590,8 +660,9 @@ int main (int argc, char **argv)
     }
 
     if (g_verbose || jobs.size() > 1) {
-        printf ("summary: %d compressed, %d decompressed, %d failed, %.4f s wall (%u thread%s)\n",
-                n_comp, n_dec, n_fail, t_all,
+        std::string n; fmt_fixed (n, t_all, 4);
+        printf ("summary: %d compressed, %d decompressed, %d failed, %s s wall (%u thread%s)\n",
+                n_comp, n_dec, n_fail, n.c_str(),
                 g_threads ? g_threads : hw, ((g_threads?g_threads:hw)==1)?"":"s");
     }
 

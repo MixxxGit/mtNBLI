@@ -31,6 +31,36 @@ Only `g++`/`gcc` and `make` are needed (C++11). No external libraries: the PNG r
 SSSE3 / SSE4.1 / SSE4.2 / AVX / AVX2 / BMI / BMI2 / FMA / POPCNT / LZCNT / AES / PCLMUL /
 MOVBE / CRC32. The default build passes it — the highest SIMD level it uses is baseline SSE2.
 
+### 1.1 Windows (`mtnbli.exe` for Windows 10 / 11, and for that matter Windows XP x64)
+
+Cross-compiled from Linux with mingw-w64:
+
+```bash
+sudo apt-get install mingw-w64       # or your distro's equivalent
+make win64                           # -> mtnbli.exe   (static, ~1.2 MB, no extra DLLs)
+make win64-isa                       # same ISA proof, for the PE file
+make win64-check                     # run the .exe under wine, compare with the native build
+```
+
+`mtnbli.exe` is statically linked against the mingw runtime, so it needs nothing but
+`KERNEL32.dll` / `ADVAPI32.dll` / `msvcrt.dll` — all present on every Windows. It carries the
+same `-mno-*` flags as the Linux build and is therefore equally happy on a Phenom II.
+
+The POSIX-only pieces have a Windows counterpart:
+
+| | Linux | Windows |
+|---|---|---|
+| catch a wild read | `sigaction(SIGSEGV)` + `siglongjmp` | vectored exception handler + `longjmp` |
+| guard page behind the input | `mmap` + `mprotect(PROT_NONE)` | `VirtualAlloc(MEM_RESERVE)`, page left uncommitted |
+| CPU name in the banner | `/proc/cpuinfo` | `CentralProcessor\0\ProcessorNameString` registry key |
+| non-ASCII file names | (bytes are bytes) | UTF‑8 → UTF‑16, `CreateFileW` |
+
+`make win64-check` (needs `wine`) decodes every stream of a directory with both builds and
+compares the two outputs byte for byte, then feeds 40 damaged streams to the `.exe` and asserts
+that none of them crashes. Current result: **23/23 identical, 0 crashes**.
+
+A prebuilt `mtnbli.exe` is attached to every release.
+
 ## 2. Usage
 
 ```
@@ -273,7 +303,8 @@ tests/
   corpus_check.py     decode a directory with mtnbli and with upstream, compare
   fuzz.py             robustness fuzzer
   bench.sh            thread scaling measurement
-  isa_check.sh        verify the binary contains no forbidden instruction
+  isa_check.sh        verify the binary contains no forbidden instruction (ELF and PE)
+  win_check.sh        run mtnbli.exe under wine, compare with the native build
   imglib.py imgcmp.py genimg.py tnbli_split.py tiles_check.py
 ```
 
