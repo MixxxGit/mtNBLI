@@ -71,7 +71,7 @@ cp "$WTMP/a1.ppm" "$WTMP/a2.ppm"; cp "$WTMP/a1.ppm" "$WTMP/a3.ppm"
 cp "$WTMP/a1.ppm" "$WTMP/суб/b1.ppm"
 W="Z:$(printf '%s' "$WTMP" | tr '/' '\\')"          # /tmp/mtnbli_wincheck.x -> Z:\tmp\...
 
-wrun () { wine "$WX" -f -v "$1" -o "$TMP/wildout.fnbli" 2>&1 | tail -1; }
+wrun () { wine "$WX" -f -v "$1" -o "$TMP/wildout.fnbli" 2>&1 | grep "^summary:"; }
 wcount () { printf '%s' "$1" | sed -n 's/^summary: \([0-9]*\) compressed.*/\1/p'; }
 
 s=$(wrun "$W\*.ppm")

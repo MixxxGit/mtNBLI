@@ -147,6 +147,42 @@ Non-ASCII directories work too: the arguments are taken from the Unicode command
 (`CommandLineToArgvW`) instead of the ANSI `argv` the C runtime normally builds, and files are
 opened with `_wfopen` after a UTF-8 → UTF-16 conversion.
 
+### 2.2 What `-v` prints (and why it no longer looks like a hang)
+
+Everything used to be printed after the last file was finished — with 115 images that is a minute
+of silence and then a wall of text. Now:
+
+* **every result is printed the moment its file is done** (so the list arrives in completion
+  order, not in argument order);
+* a **status line** in front of it says what the workers are doing *right now*:
+
+```
+[00:12] 47/115 (40%)  eta 00:18  tiles 892/2760  48 213 kB/s  | now: yt_Rv5oymOuZCc_00-19-41.png, yt_N1VSDHZ7SYo_00-12-07.png +10 more
+```
+
+  On a console it is redrawn in place with `\r`; when stdout is redirected to a file it is
+  written as a normal line at most every 5 s, so a log does not fill up with it. `tiles` is
+  the progress inside the `.tnbli` tiles — with `-T 0` one 8K frame is dozens of tiles, so
+  "files done" alone would sit still for a minute.
+* a failure is **always** reported, even without `-v`.
+
+At the end there is an overview of what the run actually achieved:
+
+```
+summary: 115 compressed, 0 decompressed, 0 failed, 38.5787 s wall (12 threads)
+----------------------------------------------------------------------------------
+compressed   : 114 files, 3.63 GB -> 2.55 GB   (-29.7 %, saved 1.08 GB)
+               average 3.0214 BPP   best 0.8874 (yt_N1VSDHZ7SYo_00-02-23.png)   worst 7.1941 (yt_267a6c30330_00-30-35.png)
+               48.0 MB/s, 13.5x on 12 threads (521.3 s of work in 38.58 s)
+failed       : 1
+               yt_267a6c30330_00-00-47.png : output exists
+```
+
+`13.5x` is the sum of the per-file times divided by the wall clock time, i.e. how much work the
+threads really got through in parallel — it is the number to look at when you change `-t`.
+Without `-v` nothing is printed per file (except failures); the summary appears whenever more
+than one file was given.
+
 The exit status is the number of files that failed.
 
 ## 3. Why a new container (`.tnbli`)?

@@ -223,20 +223,20 @@ mkdir -p "$TMP/wild/sub"
 for i in 1 2 3; do cp "$TMP/rgb_63x63.ppm" "$TMP/wild/a$i.ppm"; done
 cp "$TMP/rgb_63x63.ppm" "$TMP/wild/sub/b1.ppm"
 
-out=$("$MT" -f -v "$TMP/wild/*.ppm" -o "$TMP/wild/x.fnbli" 2>&1 | tail -1)
+out=$("$MT" -f -v "$TMP/wild/*.ppm" -o "$TMP/wild/x.fnbli" 2>&1 | grep "^summary:")
 n=$(echo "$out" | sed -n 's/^summary: \([0-9]*\) compressed.*/\1/p')
 if [ "$n" = "3" ]; then ok "'dir/*.ppm' expands to 3 files"; else bad "'dir/*.ppm'" "summary says '${out}'"; fi
 
-out=$("$MT" -f -v "$TMP/wild/*.bmp" 2>&1 | tail -1)
+out=$("$MT" -f -v "$TMP/wild/*.bmp" 2>&1 | grep "^summary:")
 if echo "$out" | grep -q "1 failed"; then ok "a pattern that matches nothing stays one failed input"
 else bad "empty pattern" "summary says '${out}'"; fi
 
-out=$("$MT" -f -v "$TMP/wild/*/*.ppm" 2>&1 | tail -1)
+out=$("$MT" -f -v "$TMP/wild/*/*.ppm" 2>&1 | grep "^summary:")
 n=$(echo "$out" | sed -n 's/^summary: \([0-9]*\) compressed.*/\1/p')
 if [ "$n" = "1" ]; then ok "'dir/*/*.ppm' (wildcard in the middle) expands to 1 file"
 else bad "two level pattern" "summary says '${out}'"; fi
 
-out=$("$MT" -f -v "$TMP/wild/a?.ppm" 2>&1 | tail -1)
+out=$("$MT" -f -v "$TMP/wild/a?.ppm" 2>&1 | grep "^summary:")
 n=$(echo "$out" | sed -n 's/^summary: \([0-9]*\) compressed.*/\1/p')
 if [ "$n" = "3" ]; then ok "'a?.ppm' (single character wildcard) expands to 3 files"
 else bad "'?' pattern" "summary says '${out}'"; fi
@@ -244,6 +244,34 @@ else bad "'?' pattern" "summary says '${out}'"; fi
 if [ -f "$TMP/wild/a1.fnbli" ] && [ -f "$TMP/wild/a2.fnbli" ] && [ -f "$TMP/wild/a3.fnbli" ]
 then ok "each expanded file got its own output name"
 else bad "expanded outputs" "missing a1/a2/a3.fnbli"; fi
+
+#===================================================================================================
+echo
+echo "8) live progress and the summary block"
+out=$("$MT" -f -v "$TMP/wild/a1.ppm" "$TMP/wild/a2.ppm" "$TMP/wild/a3.ppm" -o "$TMP/wild/y.fnbli" 2>&1)
+if echo "$out" | grep -q "^compressed   : 3 files"; then ok "summary block reports the totals"
+else bad "summary block" "no 'compressed   : 3 files' in: $(echo "$out" | tail -3)"; fi
+if echo "$out" | grep -q "average .* BPP   best"; then ok "summary block reports average / best / worst BPP"
+else bad "summary BPP" "no average/best/worst line"; fi
+if echo "$out" | grep -qE "^\(1/3\) .* -> "; then ok "results are printed with (i/n) as they finish"
+else bad "per file lines" "no '(1/3)' result line"; fi
+
+# without -v the program stays quiet until the summary (no status line, no per file line)
+out=$("$MT" -f "$TMP/wild/a1.ppm" -o "$TMP/wild/q.fnbli" 2>&1)
+if [ -z "$out" ]; then ok "without -v : no output at all for a single file"
+else bad "quiet mode" "unexpected output: $out"; fi
+
+# ... but a failure is always reported, even without -v
+out=$("$MT" "$TMP/wild/a1.ppm" -o "$TMP/wild/q.fnbli" 2>&1)          # output exists, no -f
+if echo "$out" | grep -q "FAILED : output exists"; then ok "a failure is reported even without -v"
+else bad "quiet failure" "the failed file was not reported: $out"; fi
+
+# a status line must appear in a log too (every few seconds, not on every tick)
+python3 "$here/genimg.py" "$TMP/wild/log1.ppm" 1600 1200 0 >/dev/null
+cp "$TMP/wild/log1.ppm" "$TMP/wild/log2.ppm"; cp "$TMP/wild/log1.ppm" "$TMP/wild/log3.ppm"
+out=$("$MT" -f -v -t 1 "$TMP/wild/log1.ppm" "$TMP/wild/log2.ppm" "$TMP/wild/log3.ppm" 2>&1 | grep -c "^\[00:")
+if [ "$out" -ge 1 ]; then ok "status line in a redirected log ($out line(s))"
+else bad "status line" "no '[mm:ss] i/n' line in the log"; fi
 
 echo
 echo "=================================================================================================="
