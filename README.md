@@ -1,5 +1,7 @@
 # mtnbli — multi-threaded, SIMD-free NBLI / fNBLI codec
 
+[![build](https://github.com/MixxxGit/mtNBLI/actions/workflows/build.yml/badge.svg)](https://github.com/MixxxGit/mtNBLI/actions/workflows/build.yml)
+
 `mtnbli` is a drop-in, multi-threaded replacement for the two codecs in
 [WangXuan95/NBLI](https://github.com/WangXuan95/NBLI) (v0.4, GPLv3). It
 
@@ -58,6 +60,30 @@ The POSIX-only pieces have a Windows counterpart:
 `make win64-check` (needs `wine`) decodes every stream of a directory with both builds and
 compares the two outputs byte for byte, then feeds 40 damaged streams to the `.exe` and asserts
 that none of them crashes. Current result: **23/23 identical, 0 crashes**.
+
+### 1.2 Continuous integration (or: how to get the `.exe` without installing mingw)
+
+Every push and pull request runs [`.github/workflows/build.yml`](.github/workflows/build.yml):
+
+| job | what it does |
+|---|---|
+| `linux` | portable-ISA build → full self test → ISA proof → 120 fuzz runs |
+| `windows` | `make win64` → ISA proof of the PE file → the `.exe` under wine |
+| `release` | on a `v*` tag: attaches `mtnbli-linux-x86_64`, `mtnbli-win64.exe` and a `SHA256SUMS.txt` to the release |
+
+Both binaries are downloadable from the **Artifacts** of a completed run, and, for a tagged
+commit, from the [releases page](https://github.com/MixxxGit/mtNBLI/releases).
+
+The reference binaries used by the cross checks are built by
+
+```bash
+bash tests/build_ref.sh [destdir]      # clones WangXuan95/NBLI and builds NBLI + fNBLI
+```
+
+Upstream `fNBLI` is AVX2-only, so this needs an AVX2 machine; if it fails the cross checks are
+simply skipped (that is why the step is best effort in CI).
+Note that upstream's `uPNG.c` says `#include "upng.h"` while the file is called `uPNG.h`, so the
+script drops a lowercase symlink next to it before compiling.
 
 A prebuilt `mtnbli.exe` is attached to every release.
 
@@ -212,6 +238,10 @@ The suite generates its own images and runs 303 checks:
    `mtnbli` decoder, and `mtnbli` encoder → upstream decoder — plus a check that the individual
    tiles of a `.tnbli` decode standalone with the *upstream* tool.
 6. negative tests: damaged streams must be rejected and must not leave an output file behind.
+
+The cross checks of item 5 need the *unmodified upstream* `NBLI` and `fNBLI` binaries. Point
+`REFDIR` at them (`REFDIR=/path/to/NBLI ./tests/selftest.sh`, default `../NBLI`) or build them
+with `bash tests/build_ref.sh`; without them those checks are reported as skipped.
 
 `tests/corpus_check.py` is the corresponding check on real files: it decodes every stream in a
 directory with `mtnbli` *and* with the upstream tool and compares the two images bit by bit.

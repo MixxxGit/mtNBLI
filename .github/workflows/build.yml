@@ -1,0 +1,136 @@
+#===================================================================================================
+#  mtnbli continuous integration
+#
+#    * linux    : portable-ISA build + the full self test (+ upstream cross checks) + ISA check
+#    * windows  : mingw-w64 cross build of mtnbli.exe + ISA check + running it under wine
+#    * release  : on a tag (v*), attach both binaries to the GitHub release
+#
+#  Both builds are compiled with the portable ISA flags (no SSSE3 / SSE4 / AVX / AVX2 / BMI),
+#  so the artifacts run on an AMD Phenom II and on everything newer.
+#===================================================================================================
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  #---------------------------------------------------------------------------------------------
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      REFDIR: ${{ github.workspace }}/../ref-NBLI
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build the upstream NBLI / fNBLI reference tools
+        # best effort : without them selftest.sh simply skips the cross checks
+        continue-on-error: true
+        run: bash tests/build_ref.sh "$REFDIR"
+
+      - name: build mtnbli (portable ISA)
+        run: make -j"$(nproc)"
+
+      - name: self test
+        run: ./tests/selftest.sh
+
+      - name: ISA check (must contain no SSSE3/SSE4/AVX/BMI instruction)
+        run: ./tests/isa_check.sh
+
+      - name: fuzz the decoder with damaged streams
+        run: |
+          set -e
+          python3 tests/genimg.py /tmp/fuzz.ppm 128 96 1
+          ./mtnbli          /tmp/fuzz.ppm -o /tmp/fuzz.fnbli >/dev/null
+          ./mtnbli -N -g    /tmp/fuzz.ppm -o /tmp/fuzz.nbli  >/dev/null
+          python3 tests/fuzz.py /tmp/fuzz.fnbli 60 ./mtnbli
+          python3 tests/fuzz.py /tmp/fuzz.nbli  60 ./mtnbli
+
+      - name: upload the Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtnbli-linux-x86_64
+          path: mtnbli
+          if-no-files-found: error
+
+  #---------------------------------------------------------------------------------------------
+  windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install the mingw-w64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              mingw-w64 binutils-mingw-w64-x86-64
+
+      - name: build mtnbli.exe (portable ISA, statically linked)
+        run: make win64 -j"$(nproc)"
+
+      - name: ISA check of the PE binary
+        run: ./tests/isa_check.sh mtnbli.exe
+
+      - name: install wine (best effort)
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y --no-install-recommends wine64 || true
+          command -v wine || sudo ln -sf "$(command -v wine64)" /usr/local/bin/wine
+          wine --version
+
+      - name: run the .exe under wine and compare with the native build (best effort)
+        # wine on a runner is not always able to set up a prefix; the .exe is still built and
+        # ISA-checked above, so this step is allowed to fail without failing the build
+        continue-on-error: true
+        run: |
+          make -j"$(nproc)"
+          mkdir -p /tmp/corpus
+          python3 tests/genimg.py /tmp/corpus/ci_rgb.ppm  200 150 1
+          python3 tests/genimg.py /tmp/corpus/ci_gray.pgm 200 150 0
+          ./mtnbli       /tmp/corpus/ci_rgb.ppm  -o /tmp/corpus/ci_rgb.fnbli  >/dev/null
+          ./mtnbli -N -g /tmp/corpus/ci_gray.pgm -o /tmp/corpus/ci_gray.nbli >/dev/null
+          ./tests/win_check.sh /tmp/corpus
+
+      - name: upload the Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtnbli-win64.exe
+          path: mtnbli.exe
+          if-no-files-found: error
+
+  #---------------------------------------------------------------------------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ linux, windows ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: rename and checksum
+        run: |
+          cd dist
+          mv mtnbli     mtnbli-linux-x86_64 || true
+          mv mtnbli.exe mtnbli-win64.exe    || true
+          sha256sum mtnbli-linux-x86_64 mtnbli-win64.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: attach the binaries to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/mtnbli-linux-x86_64
+            dist/mtnbli-win64.exe
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
