@@ -128,6 +128,25 @@ mtnbli -N -a -x big.ppm                     # NBLI + advanced predictor, single 
 mtnbli -f -t 6 *.fnbli *.nbli               # decode a batch, 6 threads
 ```
 
+### 2.1 Wildcards
+
+`<in>` may contain `*` and `?`:
+
+```bat
+C:\> mtnbli.exe -v "C:\sources\yt-rnd-8K\2\*.png"          :: 115 images, all cores
+C:\> mtnbli.exe -v "D:\shots\*\frame_?.png"                :: wildcard in the middle too
+```
+
+`cmd.exe` does **not** expand `*.png` itself (that is a Unix shell habit), so `mtnbli.exe` does it
+— on Windows with `FindFirstFileW`, on Linux with `glob()`. A quoted pattern works on both
+systems, and a pattern that matches nothing is reported as one failed input with the name you
+typed, not as a silent success. Only input names are expanded, never a `-o` destination; each
+expanded file gets its own output name.
+
+Non-ASCII directories work too: the arguments are taken from the Unicode command line
+(`CommandLineToArgvW`) instead of the ANSI `argv` the C runtime normally builds, and files are
+opened with `_wfopen` after a UTF-8 → UTF-16 conversion.
+
 The exit status is the number of files that failed.
 
 ## 3. Why a new container (`.tnbli`)?

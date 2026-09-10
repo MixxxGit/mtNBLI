@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include "ioutf8.h"
 
 
 // return:   0 : success    1 : failed
@@ -15,7 +16,7 @@ int writePNMImageFile (const char *p_filename, const uint8_t *p_buf, int is_rgb,
     if (width < 1 || height < 1)
         return 1;
     
-    if ((fp = fopen(p_filename, "wb")) == NULL)
+    if ((fp = mt_fopen(p_filename, "wb")) == NULL)
         return 1;
     
     fprintf(fp, "P%c\n%d %d\n255\n", (is_rgb?'6':'5'), width, height);
@@ -76,7 +77,7 @@ uint8_t* loadPNMImageFile (const char *p_filename, int *p_is_rgb, uint32_t *p_he
     uint8_t *p_buf;
     FILE *fp;
     
-    if ((fp = fopen(p_filename, "rb")) == NULL)
+    if ((fp = mt_fopen(p_filename, "rb")) == NULL)
         return NULL;
     
     P  = fgetc(fp);

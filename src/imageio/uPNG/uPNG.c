@@ -32,6 +32,7 @@ freely, subject to the following restrictions:
 #include <limits.h>
 
 #include "uPNG.h"
+#include "../ioutf8.h"
 
 #define MAKE_BYTE(b) ((b) & 0xFF)
 #define MAKE_DWORD(a,b,c,d) ((MAKE_BYTE(a) << 24) | (MAKE_BYTE(b) << 16) | (MAKE_BYTE(c) << 8) | MAKE_BYTE(d))
@@ -1171,7 +1172,7 @@ upng_t* upng_new_from_file(const char *filename)
 		return NULL;
 	}
 
-	file = fopen(filename, "rb");
+	file = mt_fopen(filename, "rb");
 	if (file == NULL) {
 		SET_ERROR(upng, UPNG_ENOTFOUND);
 		return upng;

@@ -22,10 +22,17 @@
 #include <vector>
 #include <chrono>
 #include <thread>
+#include <algorithm>
+
+#ifndef _WIN32
+#  include <glob.h>
+#  include <sys/stat.h>
+#endif
 
 #ifdef _WIN32
 #  define  WIN32_LEAN_AND_MEAN
 #  include <windows.h>
+#  include <shellapi.h>          // CommandLineToArgvW : the only way to get argv in Unicode
 // windef.h still defines the 16-bit era 'near' / 'far' macros, and 'near' is the name of the
 // NBLI distortion parameter.  They are empty and useless, drop them.
 #  undef   near
@@ -62,6 +69,7 @@ static const char *USAGE =
   "| To compress:                                                                     |\n"
   "|   <in>  can be .pgm, .ppm, .pnm or .png                                          |\n"
   "|   <out> can be .fnbli, .nbli or .tnbli (tiled).  Generated if not specified.      |\n"
+  "|   <in> may be a wildcard, e.g. \"dir\\*.png\" -- all matching files are processed   |\n"
   "|                                                                                  |\n"
   "| To decompress:                                                                   |\n"
   "|   <in>  can be .fnbli, .nbli or .tnbli                                           |\n"
@@ -539,11 +547,130 @@ static void processFile (Job &job)
     job.secs = nowSec() - t0;
 }
 
+//----------------------------------------------------------------------------------- wildcard expansion
+//  cmd.exe (and the Windows CRT, unlike the Unix shells) does NOT expand  dir\*.png  before the
+//  program sees it -- so we have to do it ourselves, otherwise the argument stays the literal
+//  name of a file called "*.png" and every input fails with "cannot open".
+//  On Linux the shell normally expands the pattern already; a *quoted* pattern reaches us and is
+//  expanded here as well, which makes the two platforms behave the same.
+//
+//  A pattern that matches nothing is passed through unchanged, so the error message still names
+//  what the user actually typed.  Only source arguments are expanded, never a -o destination.
+
+static bool hasWildcard (const char *s) {
+    for (; *s; s++)
+        if (*s == '*' || *s == '?') return true;
+    return false;
+}
+
+#ifdef _WIN32
+
+//------ UTF-8 <-> UTF-16, so that non-ASCII directories work (CreateFileW / FindFirstFileW)
+static std::wstring utf8ToWide (const std::string &s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar (CP_UTF8, 0, s.c_str(), (int) s.size(), NULL, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring w ((size_t) n, L'\0');
+    MultiByteToWideChar (CP_UTF8, 0, s.c_str(), (int) s.size(), &w[0], n);
+    return w;
+}
+static std::string wideToUtf8 (const std::wstring &w) {
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte (CP_UTF8, 0, w.c_str(), (int) w.size(), NULL, 0, NULL, NULL);
+    if (n <= 0) return std::string();
+    std::string s ((size_t) n, '\0');
+    WideCharToMultiByte (CP_UTF8, 0, w.c_str(), (int) w.size(), &s[0], n, NULL, NULL);
+    return s;
+}
+
+//  match one path component at a time, so  C:\a\*\b\*.png  works too
+static void globRec (const std::string &dir, const std::string &rest, std::vector<std::string> &out) {
+    size_t p    = rest.find_first_of ("\\/");
+    std::string comp = (p == std::string::npos) ? rest : rest.substr (0, p);
+    std::string tail = (p == std::string::npos) ? std::string() : rest.substr (p + 1);
+    char        sep  = (p == std::string::npos) ? '\\' : rest[p];
+
+    if (!hasWildcard (comp.c_str())) {                   // plain component : just walk into it
+        std::string next = dir + comp;
+        if (tail.empty()) out.push_back (next);
+        else              globRec (next + sep, tail, out);
+        return;
+    }
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW (utf8ToWide (dir + comp).c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;               // nothing matches : keep the pattern
+    do {
+        // a directory is a perfectly good match for everything but the last component
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && tail.empty()) continue;
+        std::string nm = wideToUtf8 (fd.cFileName);
+        if (nm == "." || nm == "..") continue;
+        if (tail.empty()) out.push_back (dir + nm);
+        else              globRec (dir + nm + sep, tail, out);
+    } while (FindNextFileW (h, &fd));
+    FindClose (h);
+}
+
+static void expandWildcards (const std::string &arg, std::vector<std::string> &out) {
+    if (!hasWildcard (arg.c_str())) { out.push_back (arg); return; }
+    std::vector<std::string> hits;
+    globRec (std::string(), arg, hits);
+    if (hits.empty()) { out.push_back (arg); return; }   // report the pattern itself
+    std::sort (hits.begin(), hits.end());                // deterministic, shell-like order
+    out.insert (out.end(), hits.begin(), hits.end());
+}
+
+#else                                                    // POSIX : the C library has glob()
+
+static void expandWildcards (const std::string &arg, std::vector<std::string> &out) {
+    if (!hasWildcard (arg.c_str())) { out.push_back (arg); return; }
+    glob_t g;
+    memset (&g, 0, sizeof (g));
+    if (glob (arg.c_str(), 0, NULL, &g) != 0 || g.gl_pathc == 0) {
+        globfree (&g);
+        out.push_back (arg);
+        return;
+    }
+    std::vector<std::string> hits;
+    for (size_t i=0; i<g.gl_pathc; i++) {
+        struct stat st;
+        if (stat (g.gl_pathv[i], &st) == 0 && S_ISDIR (st.st_mode)) continue;   // no directories
+        hits.push_back (g.gl_pathv[i]);
+    }
+    globfree (&g);
+    if (hits.empty()) { out.push_back (arg); return; }
+    std::sort (hits.begin(), hits.end());
+    out.insert (out.end(), hits.begin(), hits.end());
+}
+
+#endif
+
 //-------------------------------------------------------------------------------------------------- main
 #define  MAX_N_FILE  4096
 
 int main (int argc, char **argv)
 {
+#ifdef _WIN32
+    // The mingw startup code converts the command line to the *ANSI* code page before it builds
+    // argv, so every non-ASCII path arrives already mangled ('?' or mojibake) -- a Russian or
+    // Chinese directory simply does not open.  Take the arguments from the Unicode command line
+    // instead and convert them to UTF-8 here; that is what the rest of the program (and
+    // CreateFileW) expects.
+    {
+        int     wargc = 0;
+        LPWSTR *wargv = CommandLineToArgvW (GetCommandLineW(), &wargc);
+        if (wargv && wargc > 0) {
+            static std::vector<std::string>  uargv;
+            static std::vector<char *>       pargv;
+            for (int i=0; i<wargc; i++) uargv.push_back (wideToUtf8 (wargv[i]));
+            LocalFree (wargv);
+            for (size_t i=0; i<uargv.size(); i++) pargv.push_back (&uargv[i][0]);
+            argc = (int) uargv.size();
+            argv = &pargv[0];
+        }
+    }
+#endif
+
     std::vector<std::string> srcs, dsts;
 
     // ---------------- parse command line
@@ -585,7 +712,7 @@ int main (int argc, char **argv)
                 dsts.push_back (arg);
                 have_dst = true;
             } else {
-                srcs.push_back (arg);
+                expandWildcards (arg, srcs);      // "dir\*.png" : cmd.exe does not do it for us
             }
         }
     }

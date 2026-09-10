@@ -61,6 +61,39 @@ PY
 rc=$?
 [ $rc -eq 0 ] && np=$((np+1)) || nf=$((nf+1))
 
+#--------------------------------------------------------------------------- wildcards and Unicode
+#  cmd.exe does not expand  dir\*.png , and the Windows CRT hands argv to us in the ANSI code
+#  page, so both need their own code path -- and both are Windows only, so they can only be
+#  checked here.
+WTMP="$TMP/wild"; mkdir -p "$WTMP/суб"
+python3 "$here/genimg.py" "$WTMP/a1.ppm" 40 30 0
+cp "$WTMP/a1.ppm" "$WTMP/a2.ppm"; cp "$WTMP/a1.ppm" "$WTMP/a3.ppm"
+cp "$WTMP/a1.ppm" "$WTMP/суб/b1.ppm"
+W="Z:$(printf '%s' "$WTMP" | tr '/' '\\')"          # /tmp/mtnbli_wincheck.x -> Z:\tmp\...
+
+wrun () { wine "$WX" -f -v "$1" -o "$TMP/wildout.fnbli" 2>&1 | tail -1; }
+wcount () { printf '%s' "$1" | sed -n 's/^summary: \([0-9]*\) compressed.*/\1/p'; }
+
+s=$(wrun "$W\*.ppm")
+if [ "$(wcount "$s")" = "3" ]; then np=$((np+1)); echo "  ok    windows wildcard 'dir\\*.ppm' -> 3 files"
+else nf=$((nf+1)); echo "  FAIL  windows wildcard 'dir\\*.ppm' : $s"; fi
+
+s=$(wrun "$W\a?.ppm")
+if [ "$(wcount "$s")" = "3" ]; then np=$((np+1)); echo "  ok    windows wildcard 'dir\\a?.ppm' -> 3 files"
+else nf=$((nf+1)); echo "  FAIL  windows wildcard 'dir\\a?.ppm' : $s"; fi
+
+s=$(wrun "$W\*\*.ppm")
+if [ "$(wcount "$s")" = "1" ]; then np=$((np+1)); echo "  ok    windows wildcard 'dir\\*\\*.ppm' -> 1 file"
+else nf=$((nf+1)); echo "  FAIL  windows wildcard 'dir\\*\\*.ppm' : $s"; fi
+
+s=$(wrun "$W\суб\*.ppm")
+if [ "$(wcount "$s")" = "1" ]; then np=$((np+1)); echo "  ok    non-ASCII directory (UTF-8 argv + _wfopen)"
+else nf=$((nf+1)); echo "  FAIL  non-ASCII directory : $s"; fi
+
+s=$(wrun "$W\*.bmp")
+if printf '%s' "$s" | grep -q "1 failed"; then np=$((np+1)); echo "  ok    a pattern matching nothing is reported as one failed input"
+else nf=$((nf+1)); echo "  FAIL  empty pattern : $s"; fi
+
 echo
 echo "  $np passed, $nf failed, $ns skipped"
 [ $nf -eq 0 ] || exit 1

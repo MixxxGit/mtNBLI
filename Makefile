@@ -25,7 +25,7 @@ LDFLAGS  ?= -pthread
 INC      := -Isrc -Isrc/imageio
 
 SRC_CXX  := src/mtnbli.cpp src/nbli/NBLI.cpp
-SRC_C    := src/imageio/imageio_pnm.c src/imageio/imageio_png.c src/imageio/uPNG/uPNG.c
+SRC_C    := src/imageio/imageio_pnm.c src/imageio/imageio_png.c src/imageio/ioutf8.c src/imageio/uPNG/uPNG.c
 OBJ_CXX  := $(SRC_CXX:.cpp=.o)
 OBJ_C    := $(SRC_C:.c=.o)
 OBJ      := $(OBJ_CXX) $(OBJ_C)
@@ -97,6 +97,11 @@ native: $(BIN)
 
 src/mtnbli.o: src/mtnbli.cpp src/fnbli_scalar.h src/fnbli_api.h src/tiles.h src/ThreadPool.h \
               src/FileIO.h src/CRC32.h src/imageio/imageio.h
+
+# the Windows objects have no hand written dependency list, so give them all the headers --
+# otherwise editing a header leaves a stale .w.o and the .exe silently keeps the old code
+HDRS := $(wildcard src/*.h) $(wildcard src/nbli/*.h) $(wildcard src/imageio/*.h) $(wildcard src/imageio/*.h)
+$(WINOBJ): $(HDRS)
 src/nbli/NBLI.o: src/nbli/NBLI.cpp src/nbli/rANS.h src/nbli/GolombCodeTree.h src/nbli/NBLIcodec.h \
                  src/nbli/Header.h src/nbli/PlaneModel.h src/nbli/Mapper.h src/nbli/AdvancedPredictor.h
 

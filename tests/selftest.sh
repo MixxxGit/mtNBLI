@@ -216,6 +216,35 @@ EOF
 if [ $? -ne 0 ]; then ok "damaged fNBLI stream rejected"; else bad "damaged fNBLI stream" "decoder accepted garbage"; fi
 if [ ! -f "$TMP/damaged.ppm" ]; then ok "no output file written for damaged stream"; else bad "damaged stream" "output written anyway"; fi
 
+#===================================================================================================
+echo
+echo "7) wildcard arguments (\"dir\\*.png\" -- cmd.exe does not expand them for us)"
+mkdir -p "$TMP/wild/sub"
+for i in 1 2 3; do cp "$TMP/rgb_63x63.ppm" "$TMP/wild/a$i.ppm"; done
+cp "$TMP/rgb_63x63.ppm" "$TMP/wild/sub/b1.ppm"
+
+out=$("$MT" -f -v "$TMP/wild/*.ppm" -o "$TMP/wild/x.fnbli" 2>&1 | tail -1)
+n=$(echo "$out" | sed -n 's/^summary: \([0-9]*\) compressed.*/\1/p')
+if [ "$n" = "3" ]; then ok "'dir/*.ppm' expands to 3 files"; else bad "'dir/*.ppm'" "summary says '${out}'"; fi
+
+out=$("$MT" -f -v "$TMP/wild/*.bmp" 2>&1 | tail -1)
+if echo "$out" | grep -q "1 failed"; then ok "a pattern that matches nothing stays one failed input"
+else bad "empty pattern" "summary says '${out}'"; fi
+
+out=$("$MT" -f -v "$TMP/wild/*/*.ppm" 2>&1 | tail -1)
+n=$(echo "$out" | sed -n 's/^summary: \([0-9]*\) compressed.*/\1/p')
+if [ "$n" = "1" ]; then ok "'dir/*/*.ppm' (wildcard in the middle) expands to 1 file"
+else bad "two level pattern" "summary says '${out}'"; fi
+
+out=$("$MT" -f -v "$TMP/wild/a?.ppm" 2>&1 | tail -1)
+n=$(echo "$out" | sed -n 's/^summary: \([0-9]*\) compressed.*/\1/p')
+if [ "$n" = "3" ]; then ok "'a?.ppm' (single character wildcard) expands to 3 files"
+else bad "'?' pattern" "summary says '${out}'"; fi
+
+if [ -f "$TMP/wild/a1.fnbli" ] && [ -f "$TMP/wild/a2.fnbli" ] && [ -f "$TMP/wild/a3.fnbli" ]
+then ok "each expanded file got its own output name"
+else bad "expanded outputs" "missing a1/a2/a3.fnbli"; fi
+
 echo
 echo "=================================================================================================="
 echo "  $np passed, $nf failed, $ns skipped"

@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include "ioutf8.h"
 
 
 
@@ -48,7 +49,7 @@ int writePNGImageFile (const char *p_filename, const uint8_t *p_buf, int is_rgb,
     if (p_dst == NULL)
         return 1;
     
-    if ((fp = fopen(p_filename, "wb")) == NULL) {
+    if ((fp = mt_fopen(p_filename, "wb")) == NULL) {
         free(p_dst);
         return 1;
     }
