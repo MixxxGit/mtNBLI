@@ -49,9 +49,11 @@ jobs:
           set -e
           python3 tests/genimg.py /tmp/fuzz.ppm 128 96 1
           ./mtnbli          /tmp/fuzz.ppm -o /tmp/fuzz.fnbli >/dev/null
-          ./mtnbli -N -g    /tmp/fuzz.ppm -o /tmp/fuzz.nbli  >/dev/null
+          ./mtnbli -M N -g  /tmp/fuzz.ppm -o /tmp/fuzz.nbli  >/dev/null
           python3 tests/fuzz.py /tmp/fuzz.fnbli 60 ./mtnbli
           python3 tests/fuzz.py /tmp/fuzz.nbli  60 ./mtnbli
+          ./mtnbli -d -pc 9 /tmp/fuzz.nbli -o /tmp/fuzz.png
+          ./mtnbli -d -pc 0 /tmp/fuzz.nbli -o /tmp/fuzz0.png
 
       - name: upload the Linux binary
         uses: actions/upload-artifact@v4
@@ -95,7 +97,7 @@ jobs:
           python3 tests/genimg.py /tmp/corpus/ci_rgb.ppm  200 150 1
           python3 tests/genimg.py /tmp/corpus/ci_gray.pgm 200 150 0
           ./mtnbli       /tmp/corpus/ci_rgb.ppm  -o /tmp/corpus/ci_rgb.fnbli  >/dev/null
-          ./mtnbli -N -g /tmp/corpus/ci_gray.pgm -o /tmp/corpus/ci_gray.nbli >/dev/null
+          ./mtnbli -M N -g /tmp/corpus/ci_gray.pgm -o /tmp/corpus/ci_gray.nbli >/dev/null
           ./tests/win_check.sh /tmp/corpus
 
       - name: upload the Windows binary
