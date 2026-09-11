@@ -35,8 +35,20 @@
 #  Nothing is written next to the originals : every intermediate file lives in a work directory
 #  which is deleted at the end (--keep leaves it for inspection).  The report, a CSV with every
 #  single measurement and a JSON with the aggregates are written to --out (default ./bench_report).
+#
+#  Three things this script is careful about :
+#
+#    * it tells you what it is doing.  Every step is "[stage 7/45] ..." with a progress bar for
+#      the work inside it, so a run that takes half an hour never looks like it hung.
+#    * it measures the CPU time of the child process on POSIX *and* on Windows.  os.times()
+#      has no children_user/children_system on Windows and there is no `resource` module there,
+#      so on Windows the child's times are read with GetProcessTimes() from a handle the script
+#      owns itself (the handle subprocess gives us is closed the moment the child is reaped).
+#    * it does not waste disk.  Every intermediate is deleted the moment it has been consumed,
+#      and the "is it bit exact" check compares 128 bit BLAKE2b hashes of the raw pixels instead
+#      of keeping the decoded images around for a byte by byte comparison.
 #===================================================================================================
-import sys, os, csv, json, time, struct, hashlib, platform, argparse, filecmp
+import sys, os, csv, json, time, struct, hashlib, platform, argparse, shutil
 import subprocess, tempfile, threading
 
 sys.path.insert (0, os.path.dirname (os.path.abspath (__file__)))
@@ -47,15 +59,64 @@ DLINE = '-' * 100
 # work directories that must go away again, whatever happens (see the finally in __main__)
 _WORK_DIRS = []
 
+# psutil is optional : it is only a second opinion for the CPU time / RSS of the children
+try:
+    import psutil as _psutil
+except Exception:
+    _psutil = None
+
+#===================================================================================================
+#  a 128 bit hash of a file : BLAKE2b with a 16 byte digest
+#
+#  BLAKE2 lives in hashlib (nothing to install), it is C code so it runs at roughly 1 GB/s in
+#  CPython, and digest_size = 16 is its native width for a 128 bit result.  Two different images
+#  colliding by accident is a 2^-128 event -- every real difference is found, and we also keep
+#  the byte count so a truncated or padded file cannot pass either.
+#===================================================================================================
+HASH_NAME = 'blake2b-128'
+
+def file_hash128 (path, chunk = 1 << 22):
+    """-> (hex digest, file size) ; 16 bytes of BLAKE2b, read in 4 MiB blocks"""
+    h = hashlib.blake2b (digest_size = 16)
+    n = 0
+    with open (path, 'rb') as f:
+        while True:
+            b = f.read (chunk)
+            if not b: break
+            h.update (b); n += len (b)
+    return h.hexdigest(), n
+
 #===================================================================================================
 #  small helpers
 #===================================================================================================
 class Log:
+    """everything printed here also goes into report.txt -- except the progress bar"""
     def __init__ (self, path = None):
         self.f = open (path, 'w', encoding = 'utf-8') if path else None
+        try:    self.tty   = sys.stdout.isatty()
+        except Exception: self.tty = False
+        try:    self.width = shutil.get_terminal_size ((100, 24)).columns
+        except Exception: self.width = 100
+        self.width = max (40, min (self.width, 120))
+        self._last = ''; self._t = 0.0
     def __call__ (self, s = ''):
-        print (s)
+        print (s, flush = True)
         if self.f: self.f.write (s + '\n'); self.f.flush()
+    def live (self, s):
+        """the line that is overwritten by the next one : the progress bar"""
+        s = s [:self.width - 1]
+        if self.tty:
+            sys.stdout.write ('\r' + s.ljust (self.width - 1)); sys.stdout.flush()
+        else:
+            #  redirected into a file : a '\r' would only make a mess and a line per tick would
+            #  drown the report, so write at most one line a second
+            now = time.time()
+            if s != self._last and (now - self._t) >= 1.0:
+                print (s, flush = True); self._last = s; self._t = now
+    def live_end (self):
+        if self.tty:
+            sys.stdout.write ('\r' + ' ' * (self.width - 1) + '\r'); sys.stdout.flush()
+        self._last = ''
     def close (self):
         if self.f: self.f.close(); self.f = None
 
@@ -67,6 +128,11 @@ def pct (x, d = 1):  return 'n/a' if x is None else '%.*f%%' % (d, x)
 def rel (x, d = 2):  return 'n/a' if x is None else '%.*fx' % (d, x)
 def secs (x, d = 3): return 'n/a' if x is None else '%.*f' % (d, x)
 def mbs (x):         return 'n/a' if x is None else '%.1f' % x
+
+def cpu_pair (a, b):
+    """a + b of two measurements that may be missing -> None instead of a wrong number"""
+    if a is None or b is None: return None
+    return a + b
 
 def table (log, header, rows, aligns = None, indent = ' '):
     n = len (header); w = [len (h) for h in header]
@@ -86,6 +152,66 @@ def sha256_of (path):
     with open (path, 'rb') as f:
         for chunk in iter (lambda: f.read (1 << 20), b''): h.update (chunk)
     return h.hexdigest()
+
+#===================================================================================================
+#  stage counter + progress bar : a run over a folder of 8K frames takes minutes per phase,
+#  and silence looks exactly like a hang
+#===================================================================================================
+SPIN = '|/-\\'
+
+class Progress:
+    def __init__ (self, log, total, enabled = True):
+        self.log, self.total, self.on = log, max (1, total), enabled
+        self.n = 0; self.title = ''; self.steps = 0; self.unit = ''; self.done = 0
+        self.t0 = time.time(); self._i = 0
+    def tag (self):
+        return 'stage %d/%d' % (min (self.n, self.total), self.total)
+    def skip (self, k = 1):
+        """a stage will not happen (the codec failed) -- keep the numbering honest"""
+        self.total = max (self.n, self.total - k)
+    def begin (self, title, steps = 0, unit = ''):
+        self.n += 1
+        self.title, self.steps, self.unit, self.done = title, steps, unit, 0
+        self.t0 = time.time(); self._i = 0
+        self.log ('   [%s] %s' % (self.tag(), title))
+        self.draw()
+    def tick (self, k = None, note = ''):
+        self.done = (self.done + 1) if k is None else k
+        if note: self.title = note
+        self.draw()
+    def draw (self):
+        if not self.on: return
+        el = time.time() - self.t0
+        if self.steps > 1:
+            f   = min (1.0, self.done / float (self.steps))
+            n   = 30; fill = int (round (n * f))
+            bar = '#' * fill + '.' * (n - fill)
+            line = '     [%s] %3d%%  %d/%d %s  %.1f s' % (bar, int (100 * f), self.done,
+                                                          self.steps, self.unit, el)
+        else:
+            self._i += 1
+            line = '     %s %s ... %.1f s' % (SPIN [self._i % 4], self.title, el)
+        self.log.live (line)
+    def end (self, extra = ''):
+        if not self.on: return
+        el = time.time() - self.t0
+        self.log.live_end()
+        if el >= 0.5:
+            self.log ('     done in %.1f s%s' % (el, (' : ' + extra) if extra else ''))
+    def pulse_start (self, delay = 0.2):
+        """a heartbeat for a stage whose only step is one long command"""
+        if not self.on: return
+        self._stop = threading.Event()
+        def loop (stop = self._stop):
+            while not stop.is_set():
+                self.draw(); time.sleep (delay)
+        t = threading.Thread (target = loop); t.daemon = True; t.start()
+        self._beat = t
+    def pulse_stop (self):
+        if getattr (self, '_stop', None) is not None:
+            self._stop.set()
+            if getattr (self, '_beat', None) is not None: self._beat.join (0.5)
+            self._stop = self._beat = None
 
 #===================================================================================================
 #  the machine
@@ -162,7 +288,17 @@ def find_bin (directory, stem, override):
     return hits[0]
 
 #===================================================================================================
-#  run one command and measure it
+#  CPU time and peak memory of a child process -- POSIX *and* Windows
+#
+#  POSIX   : os.times() accounts for every child that has been waited for, so the delta around a
+#            run is exact, even when the child is wine with a tree of its own underneath.
+#  Windows : os.times() simply has no children_user / children_system (always 0) and the
+#            `resource` module does not exist, so the usual pair of answers is dead.  What works
+#            is GetProcessTimes() -- but the handle has to be ours and it has to be taken while
+#            the child is still alive, because subprocess closes its handle as soon as it reaps
+#            the child and OpenProcess() on a dead pid fails.  We therefore duplicate the handle
+#            right after the spawn (or open our own) and read it after the run.
+#            FILETIME counts 100 ns units.
 #===================================================================================================
 def vmhwm_kb (pid):
     try:
@@ -182,23 +318,182 @@ def children_of (pid):
     except Exception: pass
     return kids
 
+_WIN_API = {}
+
+def win_api():
+    """ctypes bindings for the two calls we need, prepared once"""
+    if os.name != 'nt': return None
+    if 'api' in _WIN_API: return _WIN_API['api']
+    api = None
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        #  a HANDLE is pointer sized -- without restype a 64 bit handle is truncated to 32 bit
+        k.GetCurrentProcess.restype  = ctypes.c_void_p
+        k.GetCurrentProcess.argtypes = []
+        k.DuplicateHandle.restype    = ctypes.c_int32
+        k.DuplicateHandle.argtypes   = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                        ctypes.POINTER (ctypes.c_void_p), ctypes.c_uint32,
+                                        ctypes.c_int, ctypes.c_uint32]
+        k.OpenProcess.restype        = ctypes.c_void_p
+        k.OpenProcess.argtypes       = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        api = (ctypes, k)
+    except Exception:
+        api = None
+    _WIN_API['api'] = api
+    return api
+
+class WinHandle:
+    """our own handle on the child, so its times stay readable after it has been reaped"""
+    def __init__ (self, popen):
+        self.h, self.api = None, win_api()
+        if not self.api: return
+        ct, k = self.api
+        try:                                        # 1) duplicate what subprocess already has
+            src = int (getattr (popen, '_handle', 0) or 0)
+            if src:
+                dup = ct.c_void_p()
+                if k.DuplicateHandle (k.GetCurrentProcess(), ct.c_void_p (src),
+                                      k.GetCurrentProcess(), ct.byref (dup),
+                                      0, True, 2):       # 2 = DUPLICATE_SAME_ACCESS
+                    self.h = dup
+        except Exception:
+            self.h = None
+        if self.h is None:                          # 2) or open our own, while it is still alive
+            try:
+                h = k.OpenProcess (0x1000, False, int (popen.pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+                self.h = ct.c_void_p (h) if h else None
+            except Exception:
+                self.h = None
+    def read (self):
+        """-> (cpu seconds, peak working set in bytes) ; either may be None"""
+        if not self.h: return (None, None)
+        ct, k = self.api
+        cpu = rss = None
+        try:
+            class FILETIME (ct.Structure):
+                _fields_ = [('lo', ct.c_uint32), ('hi', ct.c_uint32)]
+            cr, ex, kr, us = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+            k.GetProcessTimes.restype  = ct.c_int32
+            k.GetProcessTimes.argtypes = [ct.c_void_p] + [ct.POINTER (FILETIME)] * 4
+            if k.GetProcessTimes (self.h, ct.byref (cr), ct.byref (ex), ct.byref (kr), ct.byref (us)):
+                units = ((kr.hi << 32) | kr.lo) + ((us.hi << 32) | us.lo)
+                cpu = units * 1e-7                  # FILETIME is in 100 ns units
+            class PMC (ct.Structure):
+                _fields_ = [('cb', ct.c_uint32), ('PageFaultCount', ct.c_uint32),
+                            ('PeakWorkingSetSize', ct.c_size_t), ('WorkingSetSize', ct.c_size_t),
+                            ('QuotaPeakPagedPoolUsage', ct.c_size_t),
+                            ('QuotaPagedPoolUsage', ct.c_size_t),
+                            ('QuotaPeakNonPagedPoolUsage', ct.c_size_t),
+                            ('QuotaNonPagedPoolUsage', ct.c_size_t),
+                            ('PagefileUsage', ct.c_size_t), ('PeakPagefileUsage', ct.c_size_t),
+                            ('PrivateUsage', ct.c_size_t)]
+            pmc = PMC(); pmc.cb = ct.sizeof (PMC)
+            libs = [k]
+            try: libs.append (ct.windll.psapi)      # GetProcessMemoryInfo used to live there
+            except Exception: pass
+            for lib in libs:
+                try:
+                    fn = lib.GetProcessMemoryInfo
+                    fn.restype  = ct.c_int32
+                    fn.argtypes = [ct.c_void_p, ct.POINTER (PMC), ct.c_uint32]
+                    if fn (self.h, ct.byref (pmc), ct.sizeof (PMC)):
+                        rss = pmc.PeakWorkingSetSize
+                        break
+                except Exception: continue
+        except Exception:
+            pass
+        return cpu, rss
+    def close (self):
+        try:
+            if self.h: self.api[1].CloseHandle (self.h)
+        except Exception: pass
+        self.h = None
+
 class RssWatch (threading.Thread):
-    """peak RSS of a process tree by polling /proc -- a wine process is a Linux process too"""
-    def __init__ (self, pid):
-        threading.Thread.__init__ (self); self.pid = pid; self.peak = 0; self.stop = False
+    """peak RSS of the process tree, and -- where nothing else can get it -- its CPU time"""
+    def __init__ (self, pid, want_cpu = False):
+        threading.Thread.__init__ (self)
+        self.pid = pid; self.peak = 0; self.cpu = None; self.stop = False
+        self.want_cpu = want_cpu
+        self.use_proc = os.path.isdir ('/proc')
+        self.ps = None
+        if (want_cpu or not self.use_proc) and _psutil is not None:
+            try: self.ps = _psutil.Process (pid)
+            except Exception: self.ps = None
         self.daemon = True
+    def _tree (self):
+        if self.ps is None: return []
+        try: return [self.ps] + self.ps.children (recursive = True)
+        except Exception: return [self.ps]
     def run (self):
         while not self.stop:
-            seen, level = {self.pid}, [self.pid]
-            for _ in range (3):
-                nxt = set()
-                for p in level: nxt |= children_of (p)
-                nxt -= seen; seen |= nxt; level = list (nxt)
-                if not level: break
-            for p in seen:
-                v = vmhwm_kb (p)
-                if v > self.peak: self.peak = v
-            time.sleep (0.008)
+            if self.use_proc:
+                seen, level = {self.pid}, [self.pid]
+                for _ in range (3):
+                    nxt = set()
+                    for p in level: nxt |= children_of (p)
+                    nxt -= seen; seen |= nxt; level = list (nxt)
+                    if not level: break
+                for p in seen:
+                    v = vmhwm_kb (p) * 1024
+                    if v > self.peak: self.peak = v
+            elif self.ps is not None:
+                tot = 0
+                for p in self._tree():
+                    try: tot += p.memory_info().rss
+                    except Exception: pass
+                if tot > self.peak: self.peak = tot
+            if self.want_cpu and self.ps is not None:
+                tot = 0.0
+                for p in self._tree():
+                    try:
+                        t = p.cpu_times(); tot += (t.user + t.system)
+                    except Exception: pass
+                if self.cpu is None or tot > self.cpu: self.cpu = tot
+            time.sleep (0.01)
+
+class ProcMeter:
+    """puts the platform specific answers together and returns (cpu seconds, peak MB)"""
+    def __init__ (self, popen, times_before):
+        self.t0    = times_before
+        self.wh    = WinHandle (popen) if os.name == 'nt' else None
+        want_cpu   = (os.name == 'nt') or (not os.path.isdir ('/proc'))
+        self.watch = RssWatch (popen.pid, want_cpu = want_cpu)
+        self.watch.start()
+        self.how_cpu = self.how_rss = 'nothing'
+    def finish (self, wall):
+        self.watch.stop = True; self.watch.join (0.5)
+        posix = None
+        try:                                        # POSIX : os.times() accounts for every child
+            after = os.times()
+            posix = ((after.children_user + after.children_system)
+                     - (self.t0.children_user + self.t0.children_system))
+        except AttributeError:
+            posix = None
+
+        cpu, rss = None, (self.watch.peak or None)
+
+        if self.wh is not None:                      # Windows : our own handle
+            wcpu, wrss = self.wh.read()
+            self.wh.close()
+            cpu = wcpu if (wcpu and wcpu > 0) else None
+            if wrss: rss = max (rss or 0, wrss)
+            if cpu:  self.how_cpu = 'GetProcessTimes() on our own handle'
+            if wrss: self.how_rss = 'GetProcessMemoryInfo() PeakWorkingSetSize'
+        elif posix is not None and posix > 0:        # POSIX : os.times() knows every child
+            cpu = posix
+            self.how_cpu = 'os.times() children_user + children_system'
+
+        if cpu is None and self.watch.cpu:           # psutil sampled while it was alive
+            cpu = self.watch.cpu
+            self.how_cpu = 'psutil, sampled while the codec was running'
+        if cpu is not None and cpu <= 0:
+            cpu = None if wall > 0.05 else 0.0
+        if rss and self.how_rss == 'nothing':
+            self.how_rss = ('/proc/<pid>/status VmHWM' if self.watch.use_proc
+                            else 'psutil memory_info().rss')
+        return cpu, (rss / 1048576.0 if rss else None)
 
 def run_once (binobj, args, cwd, timeout):
     cmd = binobj.cmd (args)
@@ -207,27 +502,25 @@ def run_once (binobj, args, cwd, timeout):
         p = subprocess.Popen (cmd, cwd = cwd, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
     except OSError as e:
         return None, None, None, 127, '', 'cannot start %s : %s' % (cmd[0], e)
-    watch = RssWatch (p.pid); watch.start()
+    met = ProcMeter (p, before)
     try:
         out, err = p.communicate (timeout = timeout); rc = p.returncode
     except subprocess.TimeoutExpired:
         p.kill(); out, err = p.communicate(); rc = -9; err = (err or b'') + b'\nTIMEOUT'
-    wall = time.perf_counter() - t0; after = os.times()
-    watch.stop = True; watch.join (0.5)
-    cpu = (after.children_user - before.children_user) + (after.children_system - before.children_system)
-    rss = watch.peak / 1024.0 if watch.peak else None
-    if rss is None:
-        try:
-            import resource
-            rss = resource.getrusage (resource.RUSAGE_CHILDREN).ru_maxrss / 1024.0
-        except Exception: pass
+    wall = time.perf_counter() - t0
+    cpu, rss = met.finish (wall)
+    _LAST['cpu_from'] = met.how_cpu; _LAST['rss_from'] = met.how_rss
     return wall, cpu, rss, rc, out.decode ('utf-8', 'replace'), err.decode ('utf-8', 'replace')
 
-def measure (binobj, args, cwd, runs, timeout):
+#  where the last measurement got its numbers from -- printed by --diag
+_LAST = {}
+
+def measure (binobj, args, cwd, runs, timeout, tick = None):
     """run `runs` times and keep the fastest wall clock, with the cpu/rss of that run"""
     best = None
-    for _ in range (max (1, runs)):
+    for i in range (max (1, runs)):
         r = run_once (binobj, args, cwd, timeout)
+        if tick: tick (i + 1)
         if r[0] is not None and (best is None or r[0] < best[0]): best = r
     if best is None: best = (None, None, None, 127, '', 'the command never ran')
     return dict (wall = best[0], cpu = best[1], rss = best[2], rc = best[3],
@@ -283,6 +576,17 @@ def collect_images (directory, pattern, limit):
     files = [os.path.join (directory, n) for n in names]
     return files[:limit] if limit else files
 
+def chunk_by_bytes (items, size_of, limit):
+    """split so that no chunk holds more than `limit` bytes of raw pixels (but >= 1 item)"""
+    out, cur, cur_sz = [], [], 0
+    for it in items:
+        sz = size_of (it)
+        if cur and cur_sz + sz > limit:
+            out.append (cur); cur, cur_sz = [], 0
+        cur.append (it); cur_sz += max (sz, 1)
+    if cur: out.append (cur)
+    return out
+
 #===================================================================================================
 #  the codecs under test
 #===================================================================================================
@@ -295,11 +599,15 @@ class Codec:
         self.n_ok = 0; self.n_img = 0
         self.tiles = None
         self.failed = None
+        self.per_file = {}
     def mark_failed (self, why):
         self.failed = why
     @property
     def total (self):
         return None if (self.failed or not self.enc or not self.dec) else self.enc['wall'] + self.dec['wall']
+    def cpu_total (self):
+        return cpu_pair (self.enc['cpu'] if self.enc else None,
+                         self.dec['cpu'] if self.dec else None)
 
 def build_codecs (bins, args):
     mt  = ['-f'] + (['-x'] if args.crc else [])
@@ -347,15 +655,22 @@ def chunk_pairs (pairs):
     if cur: out.append (cur)
     return out
 
-def run_phase (log, codec, pairs, kind, work, runs, timeout, per_file, csv_rows, mode, raw_of):
+def run_phase (log, codec, pairs, kind, work, runs, timeout, per_file, csv_rows, mode, raw_of,
+               prog = None, title = None):
     """encode or decode a list of (src,dst) pairs; returns dict(wall,cpu,rss) or None on failure"""
-    tot = dict (wall = 0.0, cpu = 0.0, rss = 0.0)
-    args = codec.enc_args if kind == 'enc' else codec.dec_args
+    tot = dict (wall = 0.0, cpu = None, rss = 0.0)
+    args  = codec.enc_args if kind == 'enc' else codec.dec_args
     groups = [[p] for p in pairs] if per_file else chunk_pairs (pairs)
-    for g in groups:
+    nruns  = max (1, runs)
+    if prog:
+        prog.begin (title or ('%s : %s %d file(s)' % (codec.label.strip(), kind, len (pairs))),
+                    len (groups) * nruns, 'files' if per_file else 'commands')
+        prog.pulse_start()
+    for gi, g in enumerate (groups):
         argv = list (args)
         for src, dst in g: argv += [src, '-o', dst]
-        m = measure (codec.bin, argv, work, runs, timeout)
+        m = measure (codec.bin, argv, work, runs, timeout,
+                     tick = (lambda i, b = gi * nruns: prog.tick (b + i)) if prog else None)
         missing = [dst for _, dst in g if not os.path.exists (dst)]
         label = os.path.basename (g[0][0]) if per_file else '%d files' % len (g)
         csv_rows.append ([mode, codec.id, kind, label, runs,
@@ -369,12 +684,15 @@ def run_phase (log, codec, pairs, kind, work, runs, timeout, per_file, csv_rows,
             why = ('%d output file(s) missing' % len (missing)) if missing else one_error_line (m)
             codec.mark_failed ('%s failed (%s) : %s' % (kind, label, why))
             log ('   !! %-24s %s %s : %s' % (codec.label, kind, label, why))
+            if prog: prog.pulse_stop(); prog.end ('FAILED')
             return None
-        tot['wall'] += m['wall']; tot['cpu'] += m['cpu']
-        tot['rss'] = max (tot['rss'], m['rss'] or 0)
+        tot['wall'] += m['wall']
+        tot['cpu']   = cpu_pair (tot['cpu'], m['cpu']) if tot['cpu'] is not None else m['cpu']
+        tot['rss']   = max (tot['rss'], m['rss'] or 0)
         if per_file:
             key = os.path.splitext (os.path.basename (g[0][0]))[0]        # the image stem
             codec.per_file.setdefault (key, {})[kind] = m['wall']
+    if prog: prog.pulse_stop(); prog.end ('codec time %.3f s' % tot['wall'])
     return tot
 
 #===================================================================================================
@@ -404,6 +722,11 @@ def main():
     ap.add_argument ('--timeout',      type = int, default = 3600, help = 'seconds per command (default 3600)')
     ap.add_argument ('--work',         default = '', help = 'work directory (default: a temporary one, deleted at the end)')
     ap.add_argument ('--keep',         action = 'store_true', help = 'do not delete the work directory')
+    ap.add_argument ('--ref-chunk-mb', type = int, default = 512,
+                     help = 'how many megabytes of raw pixels the reference is built in (default 512)')
+    ap.add_argument ('--no-progress',  action = 'store_true', help = 'no stage counter / progress bar')
+    ap.add_argument ('--diag',         action = 'store_true',
+                     help = 'print where the CPU time and the peak memory of a child come from')
     ap.add_argument ('--wine',         default = os.environ.get ('WINE', 'wine'), help = 'wine binary (default: wine)')
     ap.add_argument ('--fnbli',  default = '', help = 'explicit path to the upstream fNBLI')
     ap.add_argument ('--nbli',   default = '', help = 'explicit path to the upstream NBLI')
@@ -455,6 +778,16 @@ def main():
     log = Log (os.path.join (out_dir, 'report.txt'))
     csv_rows = []
 
+    #------------------------------------------------------------------ how many stages will there be
+    modes  = [args.mode] if args.mode != 'both' else ['batch', 'single']
+    n_cod  = len (build_codecs (bins, args))
+    total  = 3                                   # the reference : encode, decode, hash
+    total += 4 * n_cod * len (modes)             # per codec : compress, decompress, re-decode, hash
+    if 'single' in modes:              total += 1     # thread pool probe
+    if args.compat and (bins.get ('fnbli') or bins.get ('nbli')): total += 1
+    if args.strict:                    total += 1
+    prog = Progress (log, total, enabled = not args.no_progress)
+
     #------------------------------------------------------------------ header
     log (LINE)
     log (' mtnbli benchmark : our codecs against the upstream NBLI / fNBLI')
@@ -487,16 +820,21 @@ def main():
             args.crc, args.pc, ('nbli-opts="%s"' % args.nbli_opts) if args.nbli_opts else ''))
     log ('             -pc 0 writes an uncompressed png, exactly what the author\'s tools write, so')
     log ('             that the decode column compares the codecs and not the png writers.')
+    log (' verify      %s of the raw pixels : every decoded image is hashed and deleted right'
+         % HASH_NAME)
+    log ('             away, so a comparison never keeps two copies of an 8K frame on disk.')
+    log (' stages      %d' % prog.total)
     log (' work dir    %s%s' % (work, '' if remove_work else '   (kept : --keep)'))
     try:
-        import shutil as _sh
-        need = raw_total * (2 + 0.6 * 5)          # reference pnm + streams + one png at a time
-        free = _sh.disk_usage (work).free
+        #  the streams of every codec at once (a stream is never much bigger than the raw pixels)
+        #  plus two raw sized copies : the one being written and the one being hashed
+        need = raw_total * (2 + 1.05 * n_cod)
+        free = shutil.disk_usage (work).free
         log (' disk        %s free in the work dir, this run needs about %s'
              % (num (free), num (need)))
         if need > free * 0.6:
-            log (' !! that is close to (or past) what is free : the decoded images are removed again')
-            log ('    as soon as they are checked, but consider --limit N or --mode batch.')
+            log (' !! that is close to (or past) what is free : every intermediate is removed again')
+            log ('    as soon as it has been consumed, but consider --limit N or --mode batch.')
     except Exception: pass
 
     startup = {k: startup_overhead (b) for k, b in bins.items()}
@@ -507,27 +845,85 @@ def main():
         log ('             below carries that start up.  The "cpu s" column is then the one that says')
         log ('             something about the codecs themselves.')
 
-    #------------------------------------------------------------------ reference PNM for the bit exact check
+    #------------------------------------------------------------------ can this machine be measured at all?
+    if args.diag:
+        d = os.path.join (work, 'diag'); os.makedirs (d, exist_ok = True)
+        m = measure (bins['mtnbli'], ['-f', '-M', 'F', files[0], '-o', os.path.join (d, 'p.fnbli')],
+                     d, 1, args.timeout)
+        log ()
+        log (' measurement probe (--diag), one encode of %s' % os.path.basename (files[0]))
+        log ('   wall     %.3f s' % (m['wall'] if m['wall'] is not None else float ('nan')))
+        log ('   cpu      %-8s <- %s' % (secs (m['cpu']), _LAST.get ('cpu_from', 'nothing')))
+        log ('   peak rss %-8s <- %s'
+             % (('%.1f MB' % m['rss']) if m['rss'] else 'n/a', _LAST.get ('rss_from', 'nothing')))
+        if m['cpu'] is None:
+            log ('   !! no CPU time : the "cpu s" and "cores" columns of this report stay empty.')
+        shutil_rmtree (d)
+
+    #------------------------------------------------------------------ the reference
     #  comparing PNG bytes would only compare our PNG writer with the author's, so every stream is
-    #  decoded once more into a raw PNM (not timed) and that is compared with the reference the
-    #  same way taken from the source image.
+    #  decoded once more into a raw PNM (not timed) and a 128 bit hash of that is compared with the
+    #  hash of the reference taken the same way from the source image.  The raw pixels are deleted
+    #  as soon as they are hashed -- on a folder of 8K frames they would be ~1 GB per image.
     log ()
-    log (' preparing the reference (source image -> fNBLI -> raw PNM, not timed) ...')
+    log (' preparing the reference : source -> fNBLI -> raw pixels -> hash   (not timed)')
     ref_dir = os.path.join (work, 'reference'); os.makedirs (ref_dir, exist_ok = True)
-    ref_stream = [os.path.join (ref_dir, s + '.fnbli') for (s, *_ ) in refs]
-    ref_pnm    = [os.path.join (ref_dir, s + '.pnm')   for (s, *_ ) in refs]
-    m = run_phase (log, Codec ('ref', 'reference', 'fnbli', bins['mtnbli'],
-                               ['-f', '-x', '-M', 'F', '-t', '1'], [], 'fnbli'),
-                   list (zip (files, ref_stream)), 'enc', ref_dir, 1, args.timeout, False, csv_rows, 'ref', raw_of)
-    if m is None:
-        raise SystemExit ('*** could not build the reference streams : %s' % 'see above')
-    m = run_phase (log, Codec ('ref2', 'reference', 'fnbli', bins['mtnbli'], [], ['-f'], 'pnm'),
-                   list (zip (ref_stream, ref_pnm)), 'dec', ref_dir, 1, args.timeout, False, csv_rows, 'ref', {})
-    if m is None or not all (os.path.exists (p) for p in ref_pnm):
-        raise SystemExit ('*** could not build the reference PNM files')
+    ref_hash  = {}
+    plan      = list (zip (files, [r[0] for r in refs]))
+    ref_limit = max (1, args.ref_chunk_mb) * (1 << 20)
+    chunks    = chunk_by_bytes (plan, lambda fs: raw_of.get (fs[0], 1 << 20), ref_limit)
+    ref_enc   = Codec ('ref',  'reference', 'fnbli', bins['mtnbli'], ['-f', '-x', '-M', 'F', '-t', '1'], [], 'fnbli')
+    ref_dec   = Codec ('ref2', 'reference', 'fnbli', bins['mtnbli'], [], ['-f'], 'pnm')
+    log ('   %d image(s) in %d chunk(s), at most %s of raw pixels on disk at a time'
+         % (len (plan), len (chunks), num (ref_limit)))
+
+    def ref_paths (grp):
+        enc = [(f, os.path.join (ref_dir, s + '.fnbli')) for f, s in grp]
+        dec = [(d, os.path.join (ref_dir, s + '.pnm')) for (f, s), (_, d) in zip (grp, enc)]
+        return enc, dec
+
+    prog.begin ('reference : encode the sources with mtnbli', len (chunks), 'chunks')
+    enc_chunks = []
+    for grp in chunks:
+        enc, dec = ref_paths (grp)
+        m = run_phase (log, ref_enc, enc, 'enc', ref_dir, 1, args.timeout, False, csv_rows, 'ref', raw_of)
+        if m is None:
+            raise SystemExit ('*** could not build the reference streams : see above')
+        enc_chunks.append ((grp, enc, dec))
+        prog.tick()
+    prog.end()
+
+    prog.begin ('reference : decode the streams to raw pixels', len (chunks), 'chunks')
+    for grp, enc, dec in enc_chunks:
+        m = run_phase (log, ref_dec, dec, 'dec', ref_dir, 1, args.timeout, False, csv_rows, 'ref', {})
+        if m is None:
+            raise SystemExit ('*** could not build the reference pixels : see above')
+        for _, d in enc:
+            try: os.remove (d)                        # A.fnbli : consumed, gone
+            except OSError: pass
+        prog.tick()
+    prog.end()
+
+    prog.begin ('reference : hash the raw pixels and delete them', len (plan), 'images')
+    for grp, enc, dec in enc_chunks:
+        for (f, s), (_, p) in zip (grp, dec):
+            if not os.path.exists (p):
+                raise SystemExit ('*** reference pixel file missing for %s' % s)
+            ref_hash[s] = file_hash128 (p)
+            os.remove (p)                             # A.pnm : consumed, gone
+            prog.tick()
+    prog.end ('%d hash(es)' % len (ref_hash))
+    if len (ref_hash) != len (plan):
+        raise SystemExit ('*** could not hash every reference image')
 
     #------------------------------------------------------------------ the two modes
-    modes = [args.mode] if args.mode != 'both' else ['batch', 'single']
+    #  which streams must survive for the interoperability check at the end
+    keep_for_cross = set()
+    if args.compat:
+        if bins.get ('fnbli'): keep_for_cross |= {'up_fnbli', 'mt_fnbli'}
+        if bins.get ('nbli'):  keep_for_cross |= {'up_nbli',  'mt_nbli'}
+    base_mode = 'batch' if 'batch' in modes else modes[0]
+
     results = {}
     for mode in modes:
         per_file = (mode == 'single')
@@ -554,8 +950,10 @@ def main():
             sdir = names[c.id][0]
             streams = [os.path.join (sdir, s + '.' + c.ext) for (s, *_ ) in refs]
             c.enc = run_phase (log, c, list (zip (files, streams)), 'enc', d, runs, args.timeout,
-                               per_file, csv_rows, mode, raw_of)
-            if c.enc is None: continue
+                               per_file, csv_rows, mode, raw_of, prog,
+                               '%s : compress %d image(s)' % (c.label.strip(), len (files)))
+            if c.enc is None:
+                prog.skip (3); continue
             c.stream_bytes = sum (os.path.getsize (s) for s in streams if os.path.exists (s))
             if c.ext == 'tnbli':
                 c.tiles = count_tiles (streams)
@@ -568,7 +966,15 @@ def main():
             streams = [os.path.join (sdir, s + '.' + c.ext) for (s, *_ ) in refs]
             pngs    = [os.path.join (pdir, s + '.png')      for (s, *_ ) in refs]
             c.dec = run_phase (log, c, list (zip (streams, pngs)), 'dec', d, runs, args.timeout,
-                               per_file, csv_rows, mode, {s: raw_of[f] for s, f in zip (streams, files)})
+                               per_file, csv_rows, mode, {s: raw_of[f] for s, f in zip (streams, files)},
+                               prog, '%s : decompress %d stream(s)' % (c.label.strip(), len (streams)))
+            if c.dec is None:
+                prog.skip (2); continue
+            #  the decoded PNGs are never compared byte by byte (that would compare png writers),
+            #  the check below re-decodes the stream itself -- so they can go right now, before
+            #  the next codec fills the disk with its own
+            if not args.keep and not args.strict:
+                shutil_rmtree (pdir)
 
         #---- 3) was it bit exact?  (the same decoder writes the image once more, as raw PNM)
         log (); log ('   3) verify : is what comes back the image we put in?')
@@ -579,28 +985,49 @@ def main():
             pnms    = [os.path.join (ndir, s + '.pnm')      for (s, *_ ) in refs]
             r = run_phase (log, Codec (c.id + '_pnm', c.label, c.family, c.bin, [], ['-f'], 'pnm'),
                            list (zip (streams, pnms)), 'dec', d, 1, args.timeout, False, csv_rows,
-                           mode + '-check', {})
+                           mode + '-check', {}, prog,
+                           '%s : decode %d stream(s) again for the check' % (c.label.strip(), len (streams)))
             if r is None:
                 c.mark_failed ('the stream could not be decoded again for the bit exact check')
-                continue
-            bad = [(s, *_ )[0] for (s, *_ ), got, want in zip (refs, pnms, ref_pnm)
-                   if not (os.path.exists (got) and filecmp.cmp (got, want, shallow = False))]
+                prog.skip (1); continue
+
+            prog.begin ('%s : hash %d raw image(s) and compare' % (c.label.strip(), len (pnms)),
+                        len (pnms), 'images')
+            bad = []
+            for (stem, *_ ), got in zip (refs, pnms):
+                want = ref_hash.get (stem)
+                if not os.path.exists (got):
+                    bad.append (stem); prog.tick(); continue
+                h, sz = file_hash128 (got)
+                os.remove (got)                       # hashed : the raw copy goes away at once
+                if want is None or (h, sz) != want: bad.append (stem)
+                prog.tick()
             c.n_ok = len (refs) - len (bad)
             if bad:
                 log ('   !! %-24s %d/%d image(s) are NOT bit identical : %s'
                      % (c.label, len (bad), len (refs), ', '.join (bad[:4])))
-            #  the decoded png and the pnm copy are only needed while they are checked -- on a
-            #  folder of 8K frames they are tens of GB, so they go away again right now
-            if not args.keep and not args.strict:
-                shutil_rmtree (names[c.id][1]); shutil_rmtree (names[c.id][2])
+                prog.end ('%d differ' % len (bad))
+            else:
+                prog.end ('%d/%d bit exact' % (c.n_ok, len (refs)))
+            shutil_rmtree (ndir)
+            #  the streams are the last thing this codec needed -- except the one or two files the
+            #  interoperability check at the end reads again
+            if not args.keep:
+                keep = args.compat if (mode == base_mode and c.id in keep_for_cross) else 0
+                if keep > 0:
+                    for s in streams[max (0, keep):]:
+                        try: os.remove (s)
+                        except OSError: pass
+                else:
+                    shutil_rmtree (sdir)
+
         results[mode] = codecs
         phase_table (log, codecs, raw_total, npix, startup if per_file else None)
         if per_file: per_image_table (log, codecs, refs)
 
     #------------------------------------------------------------------ why SINGLE can be slower
-    pool = None
     if 'single' in results:
-        one, allt, n = thread_pool_cost (bins, files, refs, work, args)
+        one, allt, n = thread_pool_cost (bins, files, refs, work, args, prog)
         if one and allt and (allt - one) > 0.005:
             log ()
             log (' one process per file costs us : on the smallest image one mtnbli invocation takes')
@@ -610,10 +1037,10 @@ def main():
                  % (n * (allt - one), n))
 
     #------------------------------------------------------------------ interoperability
-    compat = cross_check (log, bins, results, refs, files, work, args) if args.compat else []
+    compat = cross_check (log, bins, results, refs, work, args, ref_hash, prog) if args.compat else []
 
     #------------------------------------------------------------------ optional strict check
-    strict = strict_check (log, results, files, work) if args.strict else None
+    strict = strict_check (log, results, files, work, prog) if args.strict else None
 
     #------------------------------------------------------------------ analysis
     analyse (log, results, raw_total, npix, startup, compat, strict, q, args,
@@ -628,12 +1055,11 @@ def main():
     def jc (c):
         return dict (id = c.id, label = c.label, failed = c.failed,
                      enc_s = c.enc['wall'] if c.enc else None, dec_s = c.dec['wall'] if c.dec else None,
-                     cpu_s = (c.enc['cpu'] + c.dec['cpu']) if (c.enc and c.dec) else None,
-                     stream_bytes = c.stream_bytes, tiles = c.tiles,
+                     cpu_s = c.cpu_total(), stream_bytes = c.stream_bytes, tiles = c.tiles,
                      verified = '%d/%d' % (c.n_ok, c.n_img))
     with open (os.path.join (out_dir, 'results.json'), 'w', encoding = 'utf-8') as f:
         json.dump (dict (date = time.strftime ('%Y-%m-%d %H:%M:%S'), images = len (refs),
-                         raw_bytes = raw_total, pixels = npix,
+                         raw_bytes = raw_total, pixels = npix, hash = HASH_NAME,
                          modes = {m: [jc (c) for c in cs] for m, cs in results.items()},
                          compat = compat), f, indent = 1, default = str)
 
@@ -641,7 +1067,7 @@ def main():
     log ()
     if remove_work:
         shutil_rmtree (work)
-        log (' cleaned up  %s is gone : every stream, every decoded PNG and the reference PNM' % work)
+        log (' cleaned up  %s is gone : every stream, every decoded PNG and the reference' % work)
         log ('             that this run produced.  The originals in %s were never touched,'
              % os.path.abspath (args.images))
         log ('             and nothing was ever written into that folder.')
@@ -654,7 +1080,6 @@ def main():
     log.close()
 
 def shutil_rmtree (path):
-    import shutil
     shutil.rmtree (path, ignore_errors = True)
 
 def count_tiles (streams):
@@ -704,9 +1129,9 @@ def phase_table (log, codecs, raw_total, npix, startup):
         e, d = c.enc['wall'], c.dec['wall']
         log ('   %-26s %8s %8s %8s %6s   %8s %8s %8s %6s %12s %7s %7s    %4d/%d' % (
             c.label, secs (e), mbs (raw_total / 1e6 / e), secs (c.enc['cpu']),
-            ('%.1f' % (c.enc['cpu'] / e)) if e > 0 else 'n/a',
+            ('%.1f' % (c.enc['cpu'] / e)) if (e > 0 and c.enc['cpu']) else 'n/a',
             secs (d), mbs (raw_total / 1e6 / d), secs (c.dec['cpu']),
-            ('%.1f' % (c.dec['cpu'] / d)) if d > 0 else 'n/a',
+            ('%.1f' % (c.dec['cpu'] / d)) if (d > 0 and c.dec['cpu']) else 'n/a',
             num (c.stream_bytes), pct (100.0 * c.stream_bytes / raw_total),
             '%.3f' % (8.0 * c.stream_bytes / npix), c.n_ok, c.n_img))
     log ()
@@ -714,6 +1139,7 @@ def phase_table (log, codecs, raw_total, npix, startup):
     log ('   "cpu s" is the CPU time the codec burned in all its threads : the cost of the job')
     log ('   measured in core-seconds, so it is the number to compare a single threaded codec with.')
     log ('   "cores" is cpu s / wall s : how many cores it really kept busy.')
+    log ('   "bit exact" counts %s hashes of the raw pixels, not the bytes of a png.' % HASH_NAME)
     if startup:
         known = [v for v in startup.values() if v]
         if known:
@@ -723,41 +1149,53 @@ def phase_table (log, codecs, raw_total, npix, startup):
 #===================================================================================================
 #  interoperability : can the author's tool read our stream, and can we read theirs?
 #===================================================================================================
-def cross_check (log, bins, results, refs, files, work, args):
+def cross_check (log, bins, results, refs, work, args, ref_hash, prog = None):
     log (); log (DLINE)
     log (' interoperability : our streams read by the author\'s tool, and theirs by ours')
     log (DLINE)
     d = os.path.join (work, 'cross'); os.makedirs (d, exist_ok = True)
     out = []
-    ref_pnm = [os.path.join (work, 'reference', s + '.pnm') for (s, *_ ) in refs]
     want = refs[:max (0, args.compat)]
     plans = []
     if bins.get ('fnbli'): plans.append (('fnbli', 'up_fnbli', 'mt_fnbli'))
     if bins.get ('nbli'):  plans.append (('nbli',  'up_nbli',  'mt_nbli'))
     base_mode = 'batch' if 'batch' in results else list (results)[0]
+    jobs = []
     for fmt, up_id, mt_id in plans:
         up_dir = os.path.join (work, base_mode, up_id + '_stream')
         mt_dir = os.path.join (work, base_mode, mt_id + '_stream')
-        jobs = [("the author's stream read by mtnbli", up_dir, bins['mtnbli']),
-                ('our stream read by the author tool', mt_dir, bins[fmt])]
-        for (what, srcdir, dec) in jobs:
-            for (stem, w, h, nch, raw) in want:
-                src = os.path.join (srcdir, '%s.%s' % (stem, fmt))
-                dst = os.path.join (d, '%s.%s.pnm' % (stem, 'mt' if dec is bins['mtnbli'] else 'up'))
-                ref = os.path.join (work, 'reference', '%s.pnm' % stem)
-                if not os.path.exists (src) or not os.path.exists (ref): continue
-                r = run_once (dec, ['-f', src, '-o', dst], d, args.timeout)
-                ok = r[3] == 0 and os.path.exists (dst) and filecmp.cmp (dst, ref, shallow = False)
-                out.append (dict (fmt = fmt, check = what, image = stem, ok = bool (ok)))
-                log ('   %-8s %-36s %-26s %s' % (fmt, what, stem, 'bit exact' if ok else 'FAILED'))
+        jobs.append ((fmt, "the author's stream read by mtnbli", up_dir, bins['mtnbli']))
+        jobs.append ((fmt, 'our stream read by the author tool', mt_dir, bins[fmt]))
+    steps = sum (1 for (fmt, what, srcdir, dec) in jobs
+                 for (stem, *_ ) in want
+                 if os.path.exists (os.path.join (srcdir, '%s.%s' % (stem, fmt))))
+    if prog: prog.begin ('cross decoding the first %d image(s)' % len (want), steps, 'decodes')
+    for (fmt, what, srcdir, dec) in jobs:
+        for (stem, w, h, nch, raw) in want:
+            src = os.path.join (srcdir, '%s.%s' % (stem, fmt))
+            ref = ref_hash.get (stem)
+            if not os.path.exists (src) or ref is None: continue
+            dst = os.path.join (d, '%s.%s.pnm' % (stem, 'mt' if dec is bins['mtnbli'] else 'up'))
+            r = run_once (dec, ['-f', src, '-o', dst], d, args.timeout)
+            ok = False
+            if r[3] == 0 and os.path.exists (dst):
+                ok = (file_hash128 (dst) == ref)
+                try: os.remove (dst)
+                except OSError: pass
+            out.append (dict (fmt = fmt, check = what, image = stem, ok = bool (ok)))
+            log ('   %-8s %-36s %-26s %s' % (fmt, what, stem, 'bit exact' if ok else 'FAILED'))
+            if prog: prog.tick()
+    if prog: prog.end ('%d of %d bit exact' % (sum (1 for c in out if c['ok']), len (out)))
     return out
 
-def thread_pool_cost (bins, files, refs, work, args):
+def thread_pool_cost (bins, files, refs, work, args, prog = None):
     """what does one mtnbli invocation pay for setting its thread pool up?  (smallest image)"""
     pairs = sorted (zip (files, refs), key = lambda t: t[1][4])
-    if not pairs: return None
+    if not pairs: return None, None, 0
     img = pairs[0][0]
     d = os.path.join (work, 'poolprobe'); os.makedirs (d, exist_ok = True)
+    if prog:
+        prog.begin ('measuring what one process start costs (smallest image, 5 runs)', 10, 'runs')
     out = []
     for extra in (['-t', '1'], []):
         best = None
@@ -765,10 +1203,12 @@ def thread_pool_cost (bins, files, refs, work, args):
             m = measure (bins['mtnbli'], ['-f', '-M', 'F'] + extra + [img, '-o',
                          os.path.join (d, 'p%d.fnbli' % i)], d, 1, args.timeout)
             if m['wall'] is not None and (best is None or m['wall'] < best): best = m['wall']
+            if prog: prog.tick()
         out.append (best)
+    if prog: prog.end()
     return out[0], out[1], len (refs)
 
-def strict_check (log, results, files, work):
+def strict_check (log, results, files, work, prog = None):
     """independent, pure python pixel comparison of the decoded PNGs against the sources"""
     from imglib import read_image
     log (); log (DLINE)
@@ -781,6 +1221,7 @@ def strict_check (log, results, files, work):
         except Exception as e:
             log ('   (cannot read %s : %s)' % (stem, e))
     bad = 0
+    if prog: prog.begin ('strict pixel check in pure python', len (ref) * len (results), 'images')
     for mode, codecs in results.items():
         for c in codecs:
             if c.failed: continue
@@ -795,6 +1236,8 @@ def strict_check (log, results, files, work):
                     n = sum (1 for a, b in zip (got, want) if a != b)
                     log ('   !! %-24s %-24s %d of %d bytes differ' % (c.label, stem, n, len (want)))
                     bad += 1
+                if prog: prog.tick()
+    if prog: prog.end ('%d mismatch(es)' % bad)
     log ('   strict check : %s' % ('every decoded PNG is pixel identical to its source' if not bad
                                     else '%d mismatch(es)' % bad))
     return bad
@@ -809,7 +1252,6 @@ def analyse (log, results, raw_total, npix, startup, compat, strict, quota, args
 
     for mode, codecs in results.items():
         by = {c.id: c for c in codecs}
-        live = [c for c in codecs if not c.failed and c.enc and c.dec]
         log ()
         log (' %s mode' % mode.upper())
         pairs = []
@@ -826,9 +1268,10 @@ def analyse (log, results, raw_total, npix, startup, compat, strict, quota, args
             d = b.dec['wall'] / a.dec['wall'] if a.dec['wall'] > 0 else None
             t = (b.enc['wall'] + b.dec['wall']) / max (1e-9, a.enc['wall'] + a.dec['wall'])
             sz = (100.0 * (a.stream_bytes - b.stream_bytes) / b.stream_bytes) if b.stream_bytes else None
-            cores = (a.enc['cpu'] + a.dec['cpu']) / max (1e-9, a.enc['wall'] + a.dec['wall'])
+            ac, aw = a.cpu_total(), (a.enc['wall'] + a.dec['wall'])
             rows.append ([what, rel (e), rel (d), rel (t),
-                          ('%+.2f%%' % sz) if sz is not None else 'n/a', '%.1f' % cores])
+                          ('%+.2f%%' % sz) if sz is not None else 'n/a',
+                          ('%.1f' % (ac / aw)) if (ac and aw > 0) else 'n/a'])
         if rows:
             table (log, ['comparison', 'encode', 'decode', 'round trip', 'size', 'cores used'],
                    rows, 'l r r r r r')
@@ -838,10 +1281,13 @@ def analyse (log, results, raw_total, npix, startup, compat, strict, quota, args
         for ours, base, what in pairs:
             a, b = by.get (ours), by.get (base)
             if not a or not b or a.failed or b.failed or not a.enc or not b.enc: continue
+            ac, bc = a.cpu_total(), b.cpu_total()
+            if not ac or not bc:
+                rows.append ([what, 'n/a', 'n/a', 'n/a']); continue
             rows.append ([what,
-                          rel (b.enc['cpu'] / a.enc['cpu']) if a.enc['cpu'] > 0 else 'n/a',
-                          rel (b.dec['cpu'] / a.dec['cpu']) if a.dec['cpu'] > 0 else 'n/a',
-                          rel ((b.enc['cpu'] + b.dec['cpu']) / max (1e-9, a.enc['cpu'] + a.dec['cpu']))])
+                          rel (b.enc['cpu'] / a.enc['cpu']) if a.enc['cpu'] else 'n/a',
+                          rel (b.dec['cpu'] / a.dec['cpu']) if a.dec['cpu'] else 'n/a',
+                          rel (bc / ac)])
         if rows:
             log ()
             log ('   the same comparison in core-seconds, i.e. one core of ours against one core of theirs')
@@ -902,10 +1348,11 @@ def analyse (log, results, raw_total, npix, startup, compat, strict, quota, args
         for cid, c in bys.items():
             b = byb.get (cid)
             if not b or b.failed or c.failed or not b.enc or not c.enc: continue
+            bc = b.cpu_total(); bw = b.enc['wall'] + b.dec['wall']
             rows.append ([c.label, secs (b.enc['wall'] + b.dec['wall']),
                           secs (c.enc['wall'] + c.dec['wall']),
                           rel ((c.enc['wall'] + c.dec['wall']) / max (1e-9, b.enc['wall'] + b.dec['wall'])),
-                          '%.1f' % ((b.enc['cpu'] + b.dec['cpu']) / max (1e-9, b.enc['wall'] + b.dec['wall']))])
+                          ('%.1f' % (bc / bw)) if (bc and bw > 0) else 'n/a'])
         if rows:
             log (); log (DLINE)
             log (' batch against single')
@@ -946,8 +1393,15 @@ def analyse (log, results, raw_total, npix, startup, compat, strict, quota, args
              % (ok, len (compat), '' if ok == len (compat) else '   (that is a real problem)'))
 
     #---------------- honest caveats
+    cpu_seen = [c for c in live if c.cpu_total()]
     log ()
     log (' caveats')
+    if not cpu_seen:
+        log ('   * !! the CPU time of the child processes could not be measured on this machine, so')
+        log ('     "cpu s", "cores" and the whole core-seconds comparison are empty.  On POSIX that')
+        log ('     number comes from os.times(); on Windows it comes from GetProcessTimes() on a')
+        log ('     handle this script owns.  If both fail, install psutil (pip install psutil) -- it')
+        log ('     is then sampled while the codec runs.')
     log ('   * the author codecs are single threaded by construction; the speed ups above are')
     log ('     therefore "one core against N cores" and not "a faster algorithm against a slower one".')
     if quota:
@@ -958,6 +1412,9 @@ def analyse (log, results, raw_total, npix, startup, compat, strict, quota, args
          % (args.runs, args.single_runs))
     log ('     reading the source and writing the file, i.e. everything a user waits for.')
     log ('   * SINGLE mode pays one process start per file, which is why it is slower per byte.')
+    log ('   * "bit exact" is a %s hash of the raw pixels plus the byte count, not a byte by'
+         % HASH_NAME)
+    log ('     byte comparison of two files : the decoded images are deleted as they are hashed.')
     if wine:
         log ('   * the binaries were Windows .exe files run through wine : subtract about %.2f s from'
              % min (v for v in startup.values() if v))

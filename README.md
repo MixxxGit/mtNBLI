@@ -278,8 +278,10 @@ coder kicks in. Measured on the 6000×4000 image above (untiled baseline: 11 739
 | 16 | 11 758 142 | +0.16 % |
 | 64 | 11 919 122 | +1.53 % |
 
-Up to about 16 tiles the cost is negligible. `-T 0` (auto) picks `2 × n_threads`, clamped so that
-no strip is shorter than 96 rows.
+Up to about 16 tiles the cost is negligible. `-T 0` (auto) picks `2 × n_threads`, where
+`n_threads` is exactly the number of threads the run is going to use — `-t N` if you gave it,
+otherwise every hardware thread (minus the cgroup quota) — clamped so that no strip is shorter
+than 96 rows.
 
 Two things to keep in mind:
 
@@ -345,7 +347,7 @@ Current status: **1200 fuzz runs (200 per format, 6 formats) — 0 crashes**.
 make test                      # or:  ./tests/selftest.sh
 ```
 
-The suite generates its own images and runs 342 checks:
+The suite generates its own images and runs 347 checks:
 
 1. fNBLI round-trips over 13 images (1×1, 2×3, 17×1, 1×17, 63×63, 128×128, 200×150, 300×200,
    512×512, noisy, flat, …) — bit-exact.
@@ -365,7 +367,9 @@ The suite generates its own images and runs 342 checks:
    never grow with the level, and the default must be 6.
 11. the deflate itself: 8 buffers × 10 levels, each inflated again by Python's `zlib`.
 12. `bench_compare.py` itself: it runs, every round trip it makes comes back bit identical, it
-    writes its csv/json, it deletes its work directory and it leaves the image folder alone.
+    numbers its stages, it really measured the CPU time of the child processes (and `--diag` says
+    where it got it from), it writes its csv/json, it deletes its work directory, it deletes the
+    reference files it no longer needs and it leaves the image folder alone.
 
 The cross checks of item 5 need the *unmodified upstream* `NBLI` and `fNBLI` binaries. Point
 `REFDIR` at them (`REFDIR=/path/to/NBLI ./tests/selftest.sh`, default `../NBLI`) or build them
@@ -478,6 +482,20 @@ time is the cost of the job in core-seconds, so it is the column that compares o
 with one core of theirs — the right number when the author's `fNBLI` is running its AVX2 path
 and ours is not. The script detects AVX2 (and the cgroup quota) and says so in the report.
 
+Getting that CPU time is less obvious than it looks, and the script does it portably:
+
+| platform | where `cpu s` comes from | where `peak_rss_mb` comes from |
+|---|---|---|
+| Linux, macOS | `os.times()` (`children_user + children_system`) — accounts for every child, including a wine tree | `/proc/<pid>/status` `VmHWM`, polled for the whole tree |
+| Windows | `GetProcessTimes()` on a **handle the script owns itself** (subprocess closes its handle the moment it reaps the child, and `OpenProcess` on a dead pid fails; `os.times()` has no `children_*` on Windows and `resource` does not exist there) | `GetProcessMemoryInfo()` `PeakWorkingSetSize` |
+| any | `psutil`, sampled while the codec runs — used whenever the above gives nothing | same |
+
+`--diag` prints which of those it used on your machine, before the run starts. If none of them
+works, `cpu s` / `cores` stay empty and the report says so instead of printing a zero.
+
+The run is also **loud**: every step is announced as `[stage 7/45] …` with a progress bar and an
+elapsed time inside it, so a run over a folder of 8K frames never looks like it hung.
+
 ```
    codec                        encode                            decode                        stream                 bit exact
                              sec     MB/s    cpu s  cores       sec     MB/s    cpu s  cores        bytes    %raw      bpp
@@ -513,14 +531,28 @@ much more on a folder of 8K frames where the tiled container can use every core.
 
 Correctness is checked on the way, but not by comparing PNG bytes — that would only compare our
 PNG writer with the author's. Every stream is decoded once more into a **raw PNM** (untimed) and
-that is compared byte for byte with the PNM the same route produces from the source image. The
-report also cross decodes: the author's streams read by `mtnbli`, and ours read by the author's
-tool. `--strict` adds a pure-Python pixel comparison of the decoded PNGs (slow on big images).
+compared against the reference the same route produces from the source image. The comparison is a
+**128 bit BLAKE2b hash** (`hashlib.blake2b(digest_size=16)`, C speed, nothing to install) plus the
+byte count, so the decoded images never have to be kept: each one is hashed and deleted on the
+spot. The report also cross decodes: the author's streams read by `mtnbli`, and ours read by the
+author's tool. `--strict` adds a pure-Python pixel comparison of the decoded PNGs (slow on big
+images).
+
+Disk is treated the same way everywhere — **every intermediate is deleted the moment it has been
+consumed**:
+
+* the reference is built in chunks (`--ref-chunk-mb`, default 512 MB of raw pixels), and each
+  chunk's `.fnbli` goes away as soon as its `.pnm` exists, and the `.pnm` as soon as it is hashed;
+* the decoded PNG of a codec is deleted right after that codec's decode has been measured (it is
+  never compared byte-wise — the check re-decodes the stream itself);
+* each raw copy is deleted right after it has been hashed;
+* a codec's streams are deleted after its check, except the one or two files the cross decode at
+  the end still reads.
 
 Everything the run produces goes into one work directory which is **deleted at the end**; the
 originals are only ever read. What stays is `-o` (default `./bench_report`): `report.txt`,
 `results.csv` with every single measurement (wall, CPU, peak RSS, bytes, exit code) and
-`results.json`. Peak RSS is read from `/proc`, so it also works for a `.exe` under wine.
+`results.json`.
 
 Useful switches: `-m batch|single|both`, `-r/--runs` (repetitions, best kept), `-t/-T`
 (threads / tiles for mtnbli), `--t1` (add a single-thread `-M MT -t 1` baseline), `--nbli-opts "-g"`,
@@ -542,7 +574,7 @@ src/
   imageio/            PNM reader/writer, PNG writer, and its own deflate
     deflate.c/.h        RFC 1950/1951 encoder, levels 0..9, streams out through a sink
 tests/
-  selftest.sh         342 self-contained checks incl. upstream cross checks
+  selftest.sh         347 self-contained checks incl. upstream cross checks
   corpus_check.py     decode a directory with mtnbli and with upstream, compare
   fuzz.py             robustness fuzzer
   bench.sh            thread scaling measurement

@@ -399,7 +399,7 @@ if command -v python3 >/dev/null 2>&1; then
     nb4=$(ls "$TMP/bench_imgs" | wc -l)
 
     if python3 "$here/bench_compare.py" -c "$TMP/bench_bins" -i "$TMP/bench_imgs" \
-            -o "$TMP/bench_report" -m batch -r 1 --compat 1 --pc 0 >"$TMP/bench.txt" 2>&1
+            -o "$TMP/bench_report" -m batch -r 1 --compat 1 --pc 0 --diag >"$TMP/bench.txt" 2>&1
     then
         ok "bench_compare.py runs through (batch mode)"
     else
@@ -409,6 +409,20 @@ if command -v python3 >/dev/null 2>&1; then
     if grep -q "lossless : every one of" "$TMP/bench_report/report.txt" 2>/dev/null
     then ok "  every round trip it made came back bit identical"
     else bad "bench_compare.py verification" "$(grep -i 'lossless' "$TMP/bench_report/report.txt" 2>/dev/null | head -1)"; fi
+
+    #  the report has to say what it is doing : "stage k of n" for every step
+    if grep -q "\[stage 1/" "$TMP/bench_report/report.txt" 2>/dev/null
+    then ok "  it numbers its stages (stage k/n) so a long run never looks hung"
+    else bad "bench_compare.py stages" "no '[stage 1/' in the report"; fi
+
+    #  cpu s / peak rss of the children : empty on a machine where they cannot be measured
+    ncpu=$(awk -F, 'NR>1 && $7+0 > 0' "$TMP/bench_report/results.csv" 2>/dev/null | wc -l)
+    if [ "$ncpu" -gt 0 ]
+    then ok "  it measured the CPU time of the children ($ncpu rows with cpu_s > 0)"
+    else bad "bench_compare.py measurement" "every cpu_s is empty -- see --diag"; fi
+    if grep -q "<- " "$TMP/bench_report/report.txt" 2>/dev/null
+    then ok "  --diag says where those numbers come from"
+    else bad "bench_compare.py --diag" "no measurement probe in the report"; fi
 
     if [ -s "$TMP/bench_report/results.csv" ] && [ -s "$TMP/bench_report/results.json" ]
     then ok "  it wrote results.csv and results.json"
@@ -422,6 +436,20 @@ if command -v python3 >/dev/null 2>&1; then
     if [ "$nb4" = "$nb_after" ]
     then ok "  the image folder is untouched ($nb4 files before and after)"
     else bad "bench_compare.py cleanup" "$nb4 files before, $nb_after after"; fi
+
+    #  disk : the reference chain A.png -> A.fnbli -> A.pnm must not leave the two middle
+    #  files lying around, and only the streams the cross check still needs may survive
+    python3 "$here/bench_compare.py" -c "$TMP/bench_bins" -i "$TMP/bench_imgs" \
+            -o "$TMP/bench_report2" -m batch -r 1 --compat 1 --work "$TMP/bench_work" \
+            --no-progress >"$TMP/bench2.txt" 2>&1
+    nleft=$(find "$TMP/bench_work/reference" -type f 2>/dev/null | wc -l)
+    if [ "$nleft" = 0 ]
+    then ok "  the reference stream and pixel files are deleted once they are hashed"
+    else bad "bench_compare.py disk use" "$nleft file(s) left in the reference dir"; fi
+    nstr=$(find "$TMP/bench_work" \( -name '*.nbli' -o -name '*.fnbli' -o -name '*.tnbli' \) 2>/dev/null | wc -l)
+    if [ "$nstr" -le 4 ]
+    then ok "  only the streams the cross check still needs are left ($nstr)"
+    else bad "bench_compare.py disk use" "$nstr stream(s) left in the work dir"; fi
 else
     skip "bench_compare.py" "python3 not available"
 fi
