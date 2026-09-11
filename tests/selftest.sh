@@ -386,6 +386,46 @@ else
     skip "deflate levels" "tests/defl_test could not be built"
 fi
 
+#===================================================================================================
+echo
+echo "12) bench_compare.py : the upstream comparison harness runs, reports and cleans up"
+
+if command -v python3 >/dev/null 2>&1; then
+    mkdir -p "$TMP/bench_imgs" "$TMP/bench_bins"
+    cp "$TMP/rgb_300x200.ppm" "$TMP/rgb_128x128.ppm" "$TMP/gray_200x150.pgm" "$TMP/bench_imgs/" 2>/dev/null
+    cp "$MT" "$TMP/bench_bins/mtnbli" 2>/dev/null
+    # the author's tools, if they are there : without them the harness just measures our own codecs
+    for b in fNBLI NBLI; do [ -x "$REFDIR/$b" ] && cp "$REFDIR/$b" "$TMP/bench_bins/$b" 2>/dev/null; done
+    nb4=$(ls "$TMP/bench_imgs" | wc -l)
+
+    if python3 "$here/bench_compare.py" -c "$TMP/bench_bins" -i "$TMP/bench_imgs" \
+            -o "$TMP/bench_report" -m batch -r 1 --compat 1 --pc 0 >"$TMP/bench.txt" 2>&1
+    then
+        ok "bench_compare.py runs through (batch mode)"
+    else
+        bad "bench_compare.py" "$(tail -3 "$TMP/bench.txt" | tr '\n' ' ')"
+    fi
+
+    if grep -q "lossless : every one of" "$TMP/bench_report/report.txt" 2>/dev/null
+    then ok "  every round trip it made came back bit identical"
+    else bad "bench_compare.py verification" "$(grep -i 'lossless' "$TMP/bench_report/report.txt" 2>/dev/null | head -1)"; fi
+
+    if [ -s "$TMP/bench_report/results.csv" ] && [ -s "$TMP/bench_report/results.json" ]
+    then ok "  it wrote results.csv and results.json"
+    else bad "bench_compare.py outputs" "csv or json missing"; fi
+
+    if grep -q "cleaned up" "$TMP/bench_report/report.txt" 2>/dev/null
+    then ok "  it deleted its work directory"
+    else bad "bench_compare.py cleanup" "no 'cleaned up' in the report"; fi
+
+    nb_after=$(ls "$TMP/bench_imgs" | wc -l)
+    if [ "$nb4" = "$nb_after" ]
+    then ok "  the image folder is untouched ($nb4 files before and after)"
+    else bad "bench_compare.py cleanup" "$nb4 files before, $nb_after after"; fi
+else
+    skip "bench_compare.py" "python3 not available"
+fi
+
 echo
 echo "=================================================================================================="
 echo "  $np passed, $nf failed, $ns skipped"

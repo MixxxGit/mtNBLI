@@ -345,7 +345,7 @@ Current status: **1200 fuzz runs (200 per format, 6 formats) — 0 crashes**.
 make test                      # or:  ./tests/selftest.sh
 ```
 
-The suite generates its own images and runs 337 checks:
+The suite generates its own images and runs 342 checks:
 
 1. fNBLI round-trips over 13 images (1×1, 2×3, 17×1, 1×17, 63×63, 128×128, 200×150, 300×200,
    512×512, noisy, flat, …) — bit-exact.
@@ -364,6 +364,8 @@ The suite generates its own images and runs 337 checks:
 10. `-d` and `-pc 0..9`: every level must decode back to the original pixels, the size must
    never grow with the level, and the default must be 6.
 11. the deflate itself: 8 buffers × 10 levels, each inflated again by Python's `zlib`.
+12. `bench_compare.py` itself: it runs, every round trip it makes comes back bit identical, it
+    writes its csv/json, it deletes its work directory and it leaves the image folder alone.
 
 The cross checks of item 5 need the *unmodified upstream* `NBLI` and `fNBLI` binaries. Point
 `REFDIR` at them (`REFDIR=/path/to/NBLI ./tests/selftest.sh`, default `../NBLI`) or build them
@@ -441,6 +443,90 @@ table as "the codec stops scaling" without checking that line first.
 On real, unthrottled hardware expect the scaling to continue to the physical core count. On a
 6-core Phenom II X6 that means roughly 5–6× on a `.tnbli` and on batches.
 
+### 7.4 Comparing with the author's codecs (`tests/bench_compare.py`)
+
+`tests/bench.sh` measures `mtnbli` against itself. `bench_compare.py` measures it against the
+**upstream** NBLI / fNBLI: you point it at a folder of binaries and a folder of images, it pushes
+every image through every codec and back to PNG, and it writes a report that ends with an
+analytical summary which the script computes itself.
+
+```bash
+python3 tests/bench_compare.py -c "C:\progz\NBLI" -i "C:\sources\yt-rnd-8K"
+python3 tests/bench_compare.py -c ../NBLI -i ./shots -o ./report --keep --t1
+make bench-compare BENCH_ARGS="-c ../NBLI -i ./shots"      # the same thing through make
+```
+
+`-c` only has to contain the three binaries (`fNBLI`, `NBLI`, `mtnbli`, with or without `.exe`);
+on Linux an `.exe` is started through wine, so the Windows binaries can be compared here as well.
+Five codecs are measured, in two modes:
+
+| codec | what it is | measured in |
+|---|---|---|
+| `fNBLI (upstream)` | the author's `fNBLI`, single threaded | BATCH and SINGLE |
+| `NBLI (upstream)` | the author's `NBLI`, single threaded | BATCH and SINGLE |
+| `fNBLI (mtnbli -M F)` | ours, same stream as upstream | BATCH and SINGLE |
+| `NBLI (mtnbli -M N)` | ours, same stream as upstream | BATCH and SINGLE |
+| `mtNBLI (mtnbli -M MT)` | ours, tiled — one strip per core | BATCH and SINGLE |
+
+* **BATCH** — the whole folder in one command line, which is how you would actually use it.
+* **SINGLE** — one command per file, times summed over the files, so the cost of one process
+  start per file shows up. Comparing the two tells you what parallelism buys without having to
+  know which codec is parallel.
+
+Two things are measured for every codec and every phase: **wall clock** and **CPU time**. CPU
+time is the cost of the job in core-seconds, so it is the column that compares one core of ours
+with one core of theirs — the right number when the author's `fNBLI` is running its AVX2 path
+and ours is not. The script detects AVX2 (and the cgroup quota) and says so in the report.
+
+```
+   codec                        encode                            decode                        stream                 bit exact
+                             sec     MB/s    cpu s  cores       sec     MB/s    cpu s  cores        bytes    %raw      bpp
+   --------------------------------------------------------------------------------------------------------------------------------
+   fNBLI  (upstream)             0.185     39.2    0.200    1.1      0.159     45.7    0.160    1.0    3 689 664   50.8%  11.051       7/7
+   NBLI   (upstream)             0.569     12.8    0.570    1.0      0.514     14.1    0.510    1.0    3 640 714   50.1%  10.905       7/7
+   fNBLI  (mtnbli -M F)          0.183     39.7    0.310    1.7      0.147     49.3    0.290    2.0    3 689 664   50.8%  11.051       7/7
+   NBLI   (mtnbli -M N)          0.323     22.5    0.610    1.9      0.258     28.2    0.510    2.0    3 640 714   50.1%  10.905       7/7
+   mtNBLI (mtnbli -M MT)         0.143     50.8    0.350    2.4      0.114     63.9    0.330    2.9    3 701 476   51.0%  11.087       7/7
+```
+
+and the part that is computed, not typed in:
+
+```
+ comparison                       encode decode round trip   size cores used
+ ---------------------------------------------------------------------------
+ fNBLI  : ours vs upstream        1.01x   1.08x 1.04x      +0.00% 1.8
+ NBLI   : ours vs upstream        1.76x   1.99x 1.86x      +0.00% 1.9
+ mtNBLI : tiled vs upstream fNBLI 1.30x   1.40x 1.34x      +0.32% 2.7
+
+   the same comparison in core-seconds, i.e. one core of ours against one core of theirs
+ comparison (CPU time)            encode decode round trip
+ ---------------------------------------------------------
+ fNBLI  : ours vs upstream        0.65x   0.55x 0.60x
+ NBLI   : ours vs upstream        0.93x   1.00x 0.96x
+ mtNBLI : tiled vs upstream fNBLI 0.57x   0.48x 0.53x
+```
+
+That last block is the honest one to read on a machine with AVX2: **per core** the author's
+`fNBLI` is roughly 1.7× faster (it uses AVX2, we never do), and `mtnbli` wins it back with
+threads — 1.34× on the round trip in this run, more on an unthrottled 6- or 8-core machine, and
+much more on a folder of 8K frames where the tiled container can use every core.
+
+Correctness is checked on the way, but not by comparing PNG bytes — that would only compare our
+PNG writer with the author's. Every stream is decoded once more into a **raw PNM** (untimed) and
+that is compared byte for byte with the PNM the same route produces from the source image. The
+report also cross decodes: the author's streams read by `mtnbli`, and ours read by the author's
+tool. `--strict` adds a pure-Python pixel comparison of the decoded PNGs (slow on big images).
+
+Everything the run produces goes into one work directory which is **deleted at the end**; the
+originals are only ever read. What stays is `-o` (default `./bench_report`): `report.txt`,
+`results.csv` with every single measurement (wall, CPU, peak RSS, bytes, exit code) and
+`results.json`. Peak RSS is read from `/proc`, so it also works for a `.exe` under wine.
+
+Useful switches: `-m batch|single|both`, `-r/--runs` (repetitions, best kept), `-t/-T`
+(threads / tiles for mtnbli), `--t1` (add a single-thread `-M MT -t 1` baseline), `--nbli-opts "-g"`,
+`--pc` (PNG level for the decoder, default 0 = uncompressed like the author's tools),
+`--limit`, `--filter "*.png"`, `--keep`.
+
 ## 8. Source layout
 
 ```
@@ -456,7 +542,7 @@ src/
   imageio/            PNM reader/writer, PNG writer, and its own deflate
     deflate.c/.h        RFC 1950/1951 encoder, levels 0..9, streams out through a sink
 tests/
-  selftest.sh         337 self-contained checks incl. upstream cross checks
+  selftest.sh         342 self-contained checks incl. upstream cross checks
   corpus_check.py     decode a directory with mtnbli and with upstream, compare
   fuzz.py             robustness fuzzer
   bench.sh            thread scaling measurement
@@ -464,6 +550,8 @@ tests/
   win_check.sh        run mtnbli.exe under wine, compare with the native build
   defl_test.c         pushes 8 pathological buffers through deflate at levels 0..9
   defl_check.py       inflates every result with Python zlib and compares it back
+  bench.sh            thread scaling of mtnbli
+  bench_compare.py    mtnbli vs the upstream NBLI / fNBLI on a folder of images
   imglib.py imgcmp.py genimg.py tnbli_split.py tiles_check.py
 ```
 

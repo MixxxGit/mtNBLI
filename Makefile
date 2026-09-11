@@ -44,7 +44,7 @@ WINFLAGS = -O3 -std=c++11 -fno-strict-aliasing $(PORT_ISA) $(WARN) $(INC) \
            -static -static-libgcc -static-libstdc++
 WINCFLAGS = -O2 -std=gnu99 $(PORT_ISA) -w $(INC)
 
-.PHONY: all native clean test isa defl-test win64 win64-isa win64-check help
+.PHONY: all native clean test isa defl-test win64 win64-isa win64-check bench-compare help
 
 all: $(BIN)
 
@@ -118,9 +118,16 @@ tests/defl_test: tests/defl_test.c src/imageio/deflate.c src/imageio/deflate.h
 defl-test: tests/defl_test
 	@./tests/defl_test /tmp/mt_defl >/dev/null && python3 tests/defl_check.py /tmp/mt_defl
 
+# compare mtnbli with the upstream NBLI / fNBLI on a folder of images :
+#   make bench-compare BENCH_ARGS="-c /path/to/NBLI -i /path/to/images"   (or -h for the options)
+bench-compare: $(BIN)
+	@if [ -z "$(BENCH_ARGS)" ]; then python3 tests/bench_compare.py --help; \
+	 else python3 tests/bench_compare.py $(BENCH_ARGS); fi
+
 clean:
 	rm -f $(OBJ) $(WINOBJ) $(BIN) $(BIN)_native $(WINBIN) tests/quick_test tests/enc_test tests/defl_test
 
 help:
 	@echo "targets:  all (default, portable ISA) | native (-march=native) | test | isa | clean"
 	@echo "          win64 | win64-isa | win64-check   (cross compile mtnbli.exe, needs mingw-w64)"
+	@echo "          bench-compare BENCH_ARGS=\"-c <bin dir> -i <image dir>\" : mtnbli vs upstream"
