@@ -29,7 +29,7 @@ make isa        # verify the binary contains no forbidden instruction
 Only `g++`/`gcc` and `make` are needed (C++11). No external libraries: the PNG reader
 (uPNG) and the PNM reader are vendored.
 
-**Prebuilt binaries** ([v0.4-mt5](https://github.com/MixxxGit/mtNBLI/releases/tag/v0.4-mt5),
+**Prebuilt binaries** ([v0.4-mt6](https://github.com/MixxxGit/mtNBLI/releases/tag/v0.4-mt6),
 built by GitHub Actions, both with the portable ISA):
 
 ```
