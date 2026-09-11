@@ -66,6 +66,8 @@ inline static uint32_t tnbliTileRow (uint32_t height, uint32_t n_tiles, uint32_t
 }
 
 // how many tiles should be used for an image of this size / this many threads
+//   n_thread == 0 means "the caller did not count the threads" -- the caller is expected to pass
+//   the number of threads the pool will really run, so 0 here can only ever mean "one".
 inline static uint32_t tnbliAutoTiles (uint32_t height, uint32_t n_thread) {
     uint32_t t = n_thread ? n_thread : 1;
     t *= 2;                                            // 2 tiles per thread -> better load balance

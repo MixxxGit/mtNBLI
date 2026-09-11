@@ -617,11 +617,15 @@ static void processFile (Job &job)
 
         job.w = w; job.h = h; job.kind = 0;
 
+        //  -t was not given : g_threads is 0 and the pool will use every hardware thread, so the
+        //  automatic tile count has to be based on that same number -- otherwise a 12 core machine
+        //  would split the image into tnbliAutoTiles (h, 0) == 2 strips and gain almost nothing.
+        unsigned n_thr_tiles = g_threads ? (unsigned) g_threads : ParallelFor::defaultThreadCount();
         uint32_t n_tiles;
-        if      (g_tiles >  1) n_tiles = (uint32_t) g_tiles;             // -T N
-        else if (g_tiles == 0) n_tiles = tnbliAutoTiles (h, g_threads);  // -T 0 : auto
-        else if (g_mode == MT_TILED) n_tiles = tnbliAutoTiles (h, g_threads);
-        else                   n_tiles = 1;                              // -T 1, no -M MT
+        if      (g_tiles >  1) n_tiles = (uint32_t) g_tiles;               // -T N
+        else if (g_tiles == 0) n_tiles = tnbliAutoTiles (h, n_thr_tiles);  // -T 0 : auto
+        else if (g_mode == MT_TILED) n_tiles = tnbliAutoTiles (h, n_thr_tiles);
+        else                   n_tiles = 1;                                // -T 1, no -M MT
         if (n_tiles < 1)   n_tiles = 1;
         if (n_tiles > h)   n_tiles = h;
         bool tiled = (g_mode == MT_TILED) || (n_tiles > 1);
