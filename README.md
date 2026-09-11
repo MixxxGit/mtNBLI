@@ -29,12 +29,12 @@ make isa        # verify the binary contains no forbidden instruction
 Only `g++`/`gcc` and `make` are needed (C++11). No external libraries: the PNG reader
 (uPNG) and the PNM reader are vendored.
 
-**Prebuilt binaries** ([v0.4-mt2](https://github.com/MixxxGit/mtNBLI/releases/tag/v0.4-mt2),
+**Prebuilt binaries** ([v0.4-mt5](https://github.com/MixxxGit/mtNBLI/releases/tag/v0.4-mt5),
 built by GitHub Actions, both with the portable ISA):
 
 ```
-mtnbli-linux-x86_64     390 456 bytes   - any x86-64 Linux (glibc 2.35+)
-mtnbli-win64.exe      1 217 929 bytes   - Windows 10 / 11 (and XP x64), statically linked
+mtnbli-linux-x86_64     436 984 bytes   - any x86-64 Linux (glibc 2.35+)
+mtnbli-win64.exe      1 278 589 bytes   - Windows 10 / 11 (and XP x64), statically linked
 SHA256SUMS.txt
 ```
 
@@ -68,7 +68,7 @@ The POSIX-only pieces have a Windows counterpart:
 
 `make win64-check` (needs `wine`) decodes every stream of a directory with both builds and
 compares the two outputs byte for byte, then feeds 40 damaged streams to the `.exe` and asserts
-that none of them crashes. Current result: **23/23 identical, 0 crashes**.
+that none of them crashes. Current result: **33/33 identical, 0 crashes**.
 
 ### 1.2 Continuous integration (or: how to get the `.exe` without installing mingw)
 
@@ -102,31 +102,63 @@ A prebuilt `mtnbli.exe` is attached to every release.
 mtnbli [-switches]  <in1> [-o <out1>]  [<in2> [-o <out2>]]  ...
 
 To compress:     <in>  .pgm .ppm .pnm .png
-                 <out> .fnbli .nbli .tnbli      (derived from <in> if not given)
+                 <out> from -M               (.fnbli / .nbli / .tnbli)
 To decompress:   <in>  .fnbli .nbli .tnbli
-                 <out> .pgm .ppm .pnm .png
+                 <out> .png, or .pgm .ppm .pnm with --pnm
 
   -v          verbose
   -f          force overwrite of an existing output file
   -x          store a CRC32 in the stream when compressing (recommended)
+  -d          decode.  The inputs are our formats, the output is PNG (overrides --pnm)
+  -M <N|F|MT> output format when compressing (default F):
+                 N   NBLI   -> .nbli    slow, smallest
+                 F   fNBLI  -> .fnbli   fast
+                 MT  tiled  -> .tnbli   K independent strips, one per core
   -t <N>      number of threads            (default: all hardware threads)
-  -T <N>      number of tiles              (default 1 = a plain, untiled .fnbli/.nbli)
-              -T 0 = auto (2 tiles per thread).  N > 1 produces a .tnbli container
-  -N          compress with NBLI instead of fNBLI
+  -T <N>      number of tiles for -M MT    (default 0 = auto, 2 tiles per thread)
+  -pc <0..9>  PNG compression level        (default 6, 0 = stored)
   -g          NBLI: Golomb code tree instead of rANS   (slower, slightly smaller)
   -a          NBLI: advanced predictor                 (much slower, smaller)
   -0 .. -7    NBLI: distortion level, 0 = lossless (default), 1..7 = near-lossless
   --pnm       when decompressing, write PNM instead of PNG
 ```
 
+`-M` chooses the format *and* the codec that goes with it. `MT` is the one you want for a single
+big image: the file is split into horizontal strips that are compressed independently, so all
+cores work on one picture. The strips themselves are fNBLI, unless you add `-g` / `-a` /
+`-0..-7`, which are NBLI-only options and switch them to NBLI (`-M TN` says the same thing
+explicitly). `-M F` together with one of those options is rejected instead of silently producing
+a `.fnbli` that is not fNBLI.
+
+`-d` is never required — an input is recognised by its content — but it makes the intent explicit
+and it makes the output a PNG even when `--pnm` is set.
+
 Examples
 
 ```bash
-mtnbli -x -T 0 photo.png  -o photo.tnbli    # fNBLI, tiled, 2 tiles per thread, CRC32
-mtnbli -f --pnm photo.tnbli -o out.ppm      # decode it with every core
-mtnbli -N -a -x big.ppm                     # NBLI + advanced predictor, single stream
+mtnbli -x -M MT photo.png  -o photo.tnbli   # tiled fNBLI, 2 tiles per thread, CRC32
+mtnbli -f -d photo.tnbli                    # decode it with every core into photo.png
+mtnbli -f -d -pc 9 photo.tnbli              # ... and squeeze the PNG as hard as possible
+mtnbli -M N -a -x big.ppm                   # NBLI + advanced predictor, single stream
 mtnbli -f -t 6 *.fnbli *.nbli               # decode a batch, 6 threads
 ```
+
+### 2.0 `-pc` and the PNG writer
+
+The PNG that comes out when decompressing is written by mtnbli itself, with its own
+deflate implementation (see §2.3), and `-pc` is the same knob as the level of `zlib` / `libpng`:
+
+| `-pc` | what it does | 3840×2160 RGB, 24.9 MB |
+|-------|--------------|------------------------|
+| 0 | stored, no compression at all (the behaviour of the older releases) | 24 900 548 B, 0.9 s |
+| 1 | greedy matching, no lazy matching | 3 902 270 B, 1.1 s |
+| 3 | greedy matching, deeper hash chain | 2 870 893 B, 1.3 s |
+| 6 | **default** — lazy matching + adaptive row filters | 2 503 852 B, 1.9 s |
+| 9 | deepest chain, all five row filters tried on every pixel | 2 338 089 B, 5.2 s |
+
+The row filters matter as much as the deflate level: from `-pc 1` upwards a filter is picked per
+scanline (Up at first, then Sub / Paeth, then all five), scored on a sample of the row so that an
+8K frame does not have to be walked five times over.
 
 ### 2.1 Wildcards
 
@@ -184,6 +216,28 @@ Without `-v` nothing is printed per file (except failures); the summary appears 
 than one file was given.
 
 The exit status is the number of files that failed.
+
+### 2.3 Why the PNG writer has its own deflate
+
+`src/imageio/deflate.c` is a complete, self-contained RFC 1951 encoder with a zlib wrapper —
+LZ77 with a 64 KB sliding window, length-limited canonical Huffman codes and dynamic block
+headers. It is there because linking `zlib` would break the one promise this project makes:
+
+* a distribution `libz` is compiled for a **much newer** CPU baseline than an AMD Phenom II, and
+  the mingw copy that comes with the cross toolchain is built with BMI enabled — `isa_check.sh`
+  finds `TZCNT` in it, and `TZCNT` on a Phenom II decodes as `BSF` with the operand order
+  reversed (wrong result, no trap);
+* the codec should stay a handful of files with no external dependency.
+
+Two details are worth knowing:
+
+* the encoder **streams**. It keeps only a 64 KB window, so an 8K RGB frame (≈ 100 MB) does not
+  need a second 100 MB buffer — the old stored-only writer did;
+* the deflate output goes through a sink that writes one IDAT chunk per 64 KB, which is why a
+  `.png` written by mtnbli can contain several IDAT chunks. That is standard, and the upstream
+  `NBLI`/`fNBLI` tools (they read PNG with uPNG) open those files without complaint.
+
+Every level 0..9 is checked against Python's `zlib.decompress` in `tests/defl_check.py` (§8).
 
 ## 3. Why a new container (`.tnbli`)?
 
@@ -291,7 +345,7 @@ Current status: **1200 fuzz runs (200 per format, 6 formats) — 0 crashes**.
 make test                      # or:  ./tests/selftest.sh
 ```
 
-The suite generates its own images and runs 303 checks:
+The suite generates its own images and runs 337 checks:
 
 1. fNBLI round-trips over 13 images (1×1, 2×3, 17×1, 1×17, 63×63, 128×128, 200×150, 300×200,
    512×512, noisy, flat, …) — bit-exact.
@@ -302,6 +356,14 @@ The suite generates its own images and runs 303 checks:
    `mtnbli` decoder, and `mtnbli` encoder → upstream decoder — plus a check that the individual
    tiles of a `.tnbli` decode standalone with the *upstream* tool.
 6. negative tests: damaged streams must be rejected and must not leave an output file behind.
+7. wildcards: `dir/*.ppm`, `dir/*/*.ppm`, `a?.ppm`, a pattern that matches nothing, and one
+   output name per expanded file.
+8. the live progress of `-v` and the summary block.
+9. `-M N|F|MT`: the right suffix, lossless round-trips, the tile count, and that the removed
+   `-N` and the impossible combinations (`-M F -a`, `-M Q`) are rejected.
+10. `-d` and `-pc 0..9`: every level must decode back to the original pixels, the size must
+   never grow with the level, and the default must be 6.
+11. the deflate itself: 8 buffers × 10 levels, each inflated again by Python's `zlib`.
 
 The cross checks of item 5 need the *unmodified upstream* `NBLI` and `fNBLI` binaries. Point
 `REFDIR` at them (`REFDIR=/path/to/NBLI ./tests/selftest.sh`, default `../NBLI`) or build them
@@ -313,7 +375,7 @@ directory with `mtnbli` *and* with the upstream tool and compares the two images
 ```
 $ python3 tests/corpus_check.py /workspace/corpus mtnbli ../NBLI/fNBLI ../NBLI/NBLI
   ...
-  21 passed, 0 failed, 0 skipped
+  22 passed, 0 failed, 0 skipped
 ```
 
 ## 7. Performance — what parallelises and what does not
@@ -391,14 +453,17 @@ src/
   safedecode.h        guard page + SIGSEGV/SIGBUS recovery around each decode
   FileIO.h, CRC32.h
   nbli/               the upstream NBLI codec (hardened: bounded reads, clamped prefix sums)
-  imageio/            PNM reader/writer + uPNG
+  imageio/            PNM reader/writer, PNG writer, and its own deflate
+    deflate.c/.h        RFC 1950/1951 encoder, levels 0..9, streams out through a sink
 tests/
-  selftest.sh         303 self-contained checks incl. upstream cross checks
+  selftest.sh         337 self-contained checks incl. upstream cross checks
   corpus_check.py     decode a directory with mtnbli and with upstream, compare
   fuzz.py             robustness fuzzer
   bench.sh            thread scaling measurement
   isa_check.sh        verify the binary contains no forbidden instruction (ELF and PE)
   win_check.sh        run mtnbli.exe under wine, compare with the native build
+  defl_test.c         pushes 8 pathological buffers through deflate at levels 0..9
+  defl_check.py       inflates every result with Python zlib and compares it back
   imglib.py imgcmp.py genimg.py tnbli_split.py tiles_check.py
 ```
 

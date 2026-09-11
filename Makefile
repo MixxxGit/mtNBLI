@@ -25,7 +25,7 @@ LDFLAGS  ?= -pthread
 INC      := -Isrc -Isrc/imageio
 
 SRC_CXX  := src/mtnbli.cpp src/nbli/NBLI.cpp
-SRC_C    := src/imageio/imageio_pnm.c src/imageio/imageio_png.c src/imageio/ioutf8.c src/imageio/uPNG/uPNG.c
+SRC_C    := src/imageio/imageio_pnm.c src/imageio/imageio_png.c src/imageio/deflate.c src/imageio/ioutf8.c src/imageio/uPNG/uPNG.c
 OBJ_CXX  := $(SRC_CXX:.cpp=.o)
 OBJ_C    := $(SRC_C:.c=.o)
 OBJ      := $(OBJ_CXX) $(OBJ_C)
@@ -44,7 +44,7 @@ WINFLAGS = -O3 -std=c++11 -fno-strict-aliasing $(PORT_ISA) $(WARN) $(INC) \
            -static -static-libgcc -static-libstdc++
 WINCFLAGS = -O2 -std=gnu99 $(PORT_ISA) -w $(INC)
 
-.PHONY: all native clean test isa win64 win64-isa win64-check help
+.PHONY: all native clean test isa defl-test win64 win64-isa win64-check help
 
 all: $(BIN)
 
@@ -111,8 +111,15 @@ tests/quick_test: tests/quick_test.cpp src/fnbli_scalar.h src/fnbli_api.h
 tests/enc_test: tests/enc_test.cpp src/fnbli_scalar.h src/fnbli_api.h
 	$(CXX) $(CXXFLAGS) $(INC) -Isrc/imageio -o $@ tests/enc_test.cpp src/imageio/imageio_pnm.c
 
+# deflate round trip : every level 0..9 must inflate back to the original data
+tests/defl_test: tests/defl_test.c src/imageio/deflate.c src/imageio/deflate.h
+	$(CC) $(CFLAGS) $(INC) -o $@ tests/defl_test.c src/imageio/deflate.c
+
+defl-test: tests/defl_test
+	@./tests/defl_test /tmp/mt_defl >/dev/null && python3 tests/defl_check.py /tmp/mt_defl
+
 clean:
-	rm -f $(OBJ) $(WINOBJ) $(BIN) $(BIN)_native $(WINBIN) tests/quick_test tests/enc_test
+	rm -f $(OBJ) $(WINOBJ) $(BIN) $(BIN)_native $(WINBIN) tests/quick_test tests/enc_test tests/defl_test
 
 help:
 	@echo "targets:  all (default, portable ISA) | native (-march=native) | test | isa | clean"

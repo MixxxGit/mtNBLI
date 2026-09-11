@@ -72,21 +72,25 @@ static const char *USAGE =
   "|                                                                                  |\n"
   "| To compress:                                                                     |\n"
   "|   <in>  can be .pgm, .ppm, .pnm or .png                                          |\n"
-  "|   <out> can be .fnbli, .nbli or .tnbli (tiled).  Generated if not specified.      |\n"
+  "|   <out> is generated from -M if not given with -o                                |\n"
   "|   <in> may be a wildcard, e.g. \"dir\\*.png\" -- all matching files are processed   |\n"
   "|                                                                                  |\n"
   "| To decompress:                                                                   |\n"
-  "|   <in>  can be .fnbli, .nbli or .tnbli                                           |\n"
-  "|   <out> can be .pgm, .ppm, .pnm or .png.  Generated if not specified.             |\n"
+  "|   <in>  can be .fnbli, .nbli or .tnbli  (recognised automatically)               |\n"
+  "|   <out> is .png, or .pnm/.ppm/.pgm with --pnm.  Generated if not specified.       |\n"
   "|                                                                                  |\n"
   "| switches:                                                                        |\n"
   "|   -v        : verbose                                                            |\n"
   "|   -f        : force overwrite of output file                                     |\n"
   "|   -x        : put a CRC32 into the stream when compressing                        |\n"
+  "|   -d        : decode.  The inputs are our formats, the output is PNG              |\n"
+  "|   -M <F>    : output format when compressing (default F)                         |\n"
+  "|               N  = NBLI   -> .nbli   (slow, small)                               |\n"
+  "|               F  = fNBLI  -> .fnbli  (fast)                                      |\n"
+  "|               MT = tiled  -> .tnbli  (multi-threaded, K independent strips)       |\n"
   "|   -t <N>    : number of threads (default: all %-2d hardware threads)              |\n"
-  "|   -T <N>    : number of tiles when compressing (default 1 = plain .fnbli/.nbli)   |\n"
-  "|               -T 0 = auto (2 tiles per thread).  >1 produces a .tnbli container    |\n"
-  "|   -N        : compress with NBLI instead of fNBLI                                 |\n"
+  "|   -T <N>    : number of tiles for -M MT (default 0 = auto, 2 tiles per thread)     |\n"
+  "|   -pc <N>   : PNG compression level 0..9 when writing a .png (default 6)           |\n"
   "|   -g        : NBLI: golomb coding tree instead of ANS (slower, smaller)           |\n"
   "|   -a        : NBLI: advanced predictor (extremely slow, smaller)                  |\n"
   "|   -0..-7    : NBLI: distortion level, 0 = lossless (default), 1..7 = lossy        |\n"
@@ -114,6 +118,18 @@ static std::string wideToUtf8 (const std::wstring &w) {
     return s;
 }
 #endif
+
+//------ case insensitive compare of two ASCII strings (strcasecmp is not portable to mingw)
+static bool eqCI (const char *a, const char *b) {
+    while (*a && *b) {
+        int ca = *a, cb = *b;
+        if (ca >= 'a' && ca <= 'z') ca -= 32;
+        if (cb >= 'a' && cb <= 'z') cb -= 32;
+        if (ca != cb) return false;
+        a++; b++;
+    }
+    return *a == *b;
+}
 
 //------ size of a file, 0 if it does not exist (UTF-8 safe, >4 GB safe)
 static uint64_t fileSize (const char *p_name) {
@@ -347,14 +363,25 @@ static double nowSec () {
 }
 
 //-------------------------------------------------------------------------------------------------- globals from switches
+//  -M picks the *output format* and with it the codec:
+//      MT_NBLI : .nbli  (NBLI codec)
+//      MT_FNBLI: .fnbli (fNBLI codec)
+//      MT_TILED: .tnbli (a container of independent strips -- the tiles themselves are NBLI when
+//                        -g / -a / -1..-7 was given, and fNBLI otherwise)
+enum { MT_FNBLI = 0, MT_NBLI = 1, MT_TILED = 2 };
+
 static bool     g_verbose   = false;
 static bool     g_force     = false;
 static bool     g_crc       = false;
-static bool     g_useNBLI   = false;
 static bool     g_golomb    = false;
 static bool     g_avp       = false;
 static bool     g_pnm       = false;
+static bool     g_decode    = false;
+static bool     g_nbli_opt  = false;      // -g / -a / -1..-7 : an NBLI only option was used
+static bool     g_mode_set  = false;      // -M was given on the command line
+static int      g_mode      = MT_FNBLI;
 static int      g_near      = 0;
+static int      g_png_level = 6;
 static unsigned g_threads   = 0;
 static int      g_tiles     = 1;
 
@@ -573,8 +600,12 @@ static void processFile (Job &job)
 
     int is_rgb_i = 0;
     uint32_t h = 0, w = 0;
-    uint8_t *in_img = loadPNMImageFile (job.src.c_str(), &is_rgb_i, &h, &w);
-    if (in_img == NULL) in_img = loadPNGImageFile (job.src.c_str(), &is_rgb_i, &h, &w);
+    uint8_t *in_img = NULL;
+
+    if (!g_decode) {                                         // -d : the input is one of our streams
+        in_img = loadPNMImageFile (job.src.c_str(), &is_rgb_i, &h, &w);
+        if (in_img == NULL) in_img = loadPNGImageFile (job.src.c_str(), &is_rgb_i, &h, &w);
+    }
 
     // ---------------------------------------------------------------- compress
     if (in_img != NULL) {
@@ -582,18 +613,23 @@ static void processFile (Job &job)
         job.rgb = is_rgb ? 1 : 0;
         size_t img_size = (size_t)h * w * (is_rgb?3:1);
         uint32_t crc = g_crc ? 1u : 0u;
+        bool    use_nbli = (g_mode == MT_NBLI) || g_nbli_opt;
 
         job.w = w; job.h = h; job.kind = 0;
 
-        uint32_t n_tiles = (g_tiles > 0) ? (uint32_t)g_tiles : tnbliAutoTiles (h, g_threads);
-        if (n_tiles < 1) n_tiles = 1;
-        if ((uint32_t)n_tiles > h) n_tiles = h;
-        bool tiled = (n_tiles > 1);
+        uint32_t n_tiles;
+        if      (g_tiles >  1) n_tiles = (uint32_t) g_tiles;             // -T N
+        else if (g_tiles == 0) n_tiles = tnbliAutoTiles (h, g_threads);  // -T 0 : auto
+        else if (g_mode == MT_TILED) n_tiles = tnbliAutoTiles (h, g_threads);
+        else                   n_tiles = 1;                              // -T 1, no -M MT
+        if (n_tiles < 1)   n_tiles = 1;
+        if (n_tiles > h)   n_tiles = h;
+        bool tiled = (g_mode == MT_TILED) || (n_tiles > 1);
 
         if (!tiled) {                                        // ---- plain single stream
             uint8_t *out = NULL;
             size_t   cs  = 0;
-            if (g_useNBLI) {
+            if (use_nbli) {
                 bool ug = g_golomb, ua = g_avp; int16_t nr = (int16_t)g_near;
                 out = NBLIcompress (cs, in_img, is_rgb, h, w, ug, ua, nr, crc);
             } else {
@@ -603,7 +639,8 @@ static void processFile (Job &job)
             if (out == NULL) { job.note = "compress failed"; return; }
             job.crc = crc; job.bytes = cs;
 
-            std::string dst = job.dst.empty() ? replaceFileSuffix (job.src.c_str(), g_useNBLI?"nbli":"fnbli") : job.dst;
+            std::string dst = job.dst.empty()
+                ? replaceFileSuffix (job.src.c_str(), use_nbli ? "nbli" : "fnbli") : job.dst;
             if (!g_force && fileExist (dst.c_str())) { job.note = "output exists"; delete[] out; return; }
             if (writeBytesToFile (dst.c_str(), out, cs)) { job.note = "write failed"; delete[] out; return; }
             delete[] out;
@@ -625,7 +662,7 @@ static void processFile (Job &job)
             uint32_t tcrc = g_crc ? 1u : 0u;
             size_t   cs   = 0;
             uint8_t *out  = NULL;
-            if (g_useNBLI) {
+            if (use_nbli) {
                 bool ug = g_golomb, ua = g_avp; int16_t nr = (int16_t)g_near;
                 out = NBLIcompress (cs, p, is_rgb, th_, w, ug, ua, nr, tcrc);
             } else {
@@ -662,7 +699,7 @@ static void processFile (Job &job)
         ph->height  = h;
         ph->n_tiles = n_tiles;
         ph->crc32   = full_crc;
-        ph->codec   = g_useNBLI ? TNBLI_CODEC_NBLI : TNBLI_CODEC_FNBLI;
+        ph->codec   = use_nbli ? TNBLI_CODEC_NBLI : TNBLI_CODEC_FNBLI;
         ph->flags   = (is_rgb?TNBLI_FLAG_RGB:0) | (g_avp?TNBLI_FLAG_AVP:0) | (g_golomb?TNBLI_FLAG_GOLOMB:0);
         ph->near_   = (uint16_t) g_near;
         ph->reserved= 0;
@@ -717,8 +754,9 @@ static void processFile (Job &job)
 
     job.w = w; job.h = h; job.crc = crc; job.kind = 1; job.bytes = len; job.rgb = is_rgb ? 1 : 0;
 
+    // -d means "decode one of our streams into a PNG", so it overrides --pnm
     std::string dst = job.dst.empty()
-        ? replaceFileSuffix (job.src.c_str(), g_pnm ? (is_rgb?"ppm":"pgm") : "png")
+        ? replaceFileSuffix (job.src.c_str(), (g_pnm && !g_decode) ? (is_rgb?"ppm":"pgm") : "png")
         : job.dst;
 
     if (!g_force && fileExist (dst.c_str())) { job.note = "output exists"; delete[] p_img; return; }
@@ -728,7 +766,7 @@ static void processFile (Job &job)
                matchSuffixIgnoringCase (dst.c_str(), "pgm")) {
         failed = writePNMImageFile (dst.c_str(), p_img, is_rgb?1:0, h, w);
     } else if (matchSuffixIgnoringCase (dst.c_str(), "png")) {
-        failed = writePNGImageFile (dst.c_str(), p_img, is_rgb?1:0, h, w);
+        failed = writePNGImageFile (dst.c_str(), p_img, is_rgb?1:0, h, w, g_png_level);
     } else {
         delete[] p_img;
         job.note = "unsupported output suffix";
@@ -860,14 +898,30 @@ int main (int argc, char **argv)
 
         if (arg[0] == '-' && arg[1] != '\0' && !(arg[1]=='0')) {
             if (!strcmp (arg, "-pnm") || !strcmp (arg, "--pnm")) { g_pnm = true; continue; }
+
+            // -pc <0..9> : PNG compression level.  Accepts  -pc 9   -pc9   -pc=9
+            if (!strncmp (arg, "-pc", 3)) {
+                const char *v = (arg[3] == '=') ? arg + 4 : arg + 3;
+                if (*v == '\0') {                                  // "-pc 9"
+                    if (i+1 >= argc) { fprintf (stderr, "mtnbli: -pc needs a level 0..9\n"); return 1; }
+                    v = argv[++i];
+                }
+                if (v[0] < '0' || v[0] > '9' || v[1] != '\0') {
+                    fprintf (stderr, "mtnbli: -pc needs a level 0..9, got '%s'\n", v);
+                    return 1;
+                }
+                g_png_level = v[0] - '0';
+                continue;
+            }
+
             for (arg++ ; *arg ; arg++) {
                 switch (*arg) {
                     case 'v': case 'V': g_verbose = true; break;
                     case 'f': case 'F': g_force   = true; break;
                     case 'x': case 'X': g_crc     = true; break;
-                    case 'N':           g_useNBLI = true; break;
-                    case 'g': case 'G': g_golomb  = true; g_useNBLI = true; break;
-                    case 'a': case 'A': g_avp     = true; g_useNBLI = true; break;
+                    case 'd': case 'D': g_decode  = true; break;
+                    case 'g': case 'G': g_golomb  = true; g_nbli_opt = true; break;
+                    case 'a': case 'A': g_avp     = true; g_nbli_opt = true; break;
                     case 'o': case 'O': next_is_dst = true; break;
                     case 't':
                         if (i+1 < argc) g_threads = (unsigned) atoi (argv[++i]);
@@ -875,13 +929,36 @@ int main (int argc, char **argv)
                     case 'T':
                         if (i+1 < argc) g_tiles = atoi (argv[++i]);
                         break;
+                    case 'N':           // -N is gone : it was replaced by -M N
+                        fprintf (stderr, "mtnbli: -N is gone, use '-M N' (NBLI) or '-M MT' (tiled)\n");
+                        return 1;
+                    case 'M': {         // -M N | F | MT   (also -MN, -M=MT, ...)
+                        const char *v = (*(arg+1) == '=') ? arg + 2 : arg + 1;
+                        if (*v == '\0') {
+                            if (i+1 >= argc) { fprintf (stderr, "mtnbli: -M needs N, F or MT\n"); return 1; }
+                            v = argv[++i];
+                        }
+                        if      (eqCI (v, "N")  || eqCI (v, "nbli"))  { g_mode = MT_NBLI;  }
+                        else if (eqCI (v, "F")  || eqCI (v, "fnbli")) { g_mode = MT_FNBLI; }
+                        else if (eqCI (v, "MT") || eqCI (v, "tnbli") ||
+                                 eqCI (v, "T"))                       { g_mode = MT_TILED; }
+                        else if (eqCI (v, "TN") || eqCI (v, "NT")) {
+                            g_mode = MT_TILED; g_nbli_opt = true;                   // tiled + NBLI
+                        } else {
+                            fprintf (stderr, "mtnbli: -M needs N, F or MT, got '%s'\n", v);
+                            return 1;
+                        }
+                        g_mode_set = true;
+                        arg += strlen (arg) - 1;      // the rest of this token was the value
+                        break;
+                    }
                     default:
-                        if (*arg >= '0' && *arg <= '7') { g_near = *arg - '0'; g_useNBLI = true; }
+                        if (*arg >= '0' && *arg <= '7') { g_near = *arg - '0'; g_nbli_opt = true; }
                         break;
                 }
             }
         } else if (arg[0]=='-' && arg[1]=='0') {
-            g_near = 0; g_useNBLI = true;
+            g_near = 0; g_nbli_opt = true;
         } else {
             if (next_is_dst) {
                 next_is_dst = false;
@@ -895,6 +972,18 @@ int main (int argc, char **argv)
         }
     }
     (void) have_dst;
+
+    // ---------------- decide what the switches mean together
+    if (g_decode && g_mode_set) {
+        fprintf (stderr, "mtnbli: -d decodes, -M selects the compression format -- use only one\n");
+        return 1;
+    }
+    if (!g_mode_set && g_nbli_opt)               // -g / -a / -1..-7 on their own ask for NBLI
+        g_mode = MT_NBLI;
+    if (g_mode == MT_FNBLI && g_nbli_opt) {
+        fprintf (stderr, "mtnbli: -M F : -g / -a / -1..-7 need the NBLI codec (-M N or -M MT)\n");
+        return 1;
+    }
 
     FaultGuard::install();
     unsigned hw = ParallelFor::defaultThreadCount();

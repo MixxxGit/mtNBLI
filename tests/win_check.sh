@@ -94,6 +94,28 @@ s=$(wrun "$W\*.bmp")
 if printf '%s' "$s" | grep -q "1 failed"; then np=$((np+1)); echo "  ok    a pattern matching nothing is reported as one failed input"
 else nf=$((nf+1)); echo "  FAIL  empty pattern : $s"; fi
 
+#--------------------------------------------------------------------------- -M / -d / -pc
+#  The PNG writer is the one place where the Windows build goes through _wfopen and where our
+#  own deflate runs, so it is worth checking under wine as well.
+w1 () { wine "$WX" "$@" >/dev/null 2>&1; }
+
+for m in N F MT; do
+    case $m in N) suf=nbli;; F) suf=fnbli;; MT) suf=tnbli;; esac
+    rm -f "$WTMP/a1.$suf"
+    if w1 -f -M $m "$WTMP/a1.ppm" && [ -f "$WTMP/a1.$suf" ]
+    then np=$((np+1)); echo "  ok    windows -M $m writes a .$suf"
+    else nf=$((nf+1)); echo "  FAIL  windows -M $m : no .$suf"; fi
+done
+
+rm -f "$WTMP/a1.png"
+if w1 -f -d -pc 9 "$WTMP/a1.fnbli" && [ -f "$WTMP/a1.png" ]
+then np=$((np+1)); echo "  ok    windows -d -pc 9 writes a .png"
+else nf=$((nf+1)); echo "  FAIL  windows -d -pc 9 : no .png"; fi
+
+if python3 "$here/imgcmp.py" "$WTMP/a1.ppm" "$WTMP/a1.png" >/dev/null 2>&1
+then np=$((np+1)); echo "  ok    windows PNG output decodes to the original pixels"
+else nf=$((nf+1)); echo "  FAIL  windows PNG output : pixels differ"; fi
+
 echo
 echo "  $np passed, $nf failed, $ns skipped"
 [ $nf -eq 0 ] || exit 1

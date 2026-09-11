@@ -1,7 +1,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include "ioutf8.h"
+#include "deflate.h"
 
 
 
@@ -34,74 +36,162 @@ static void write_png_chunk (char *p_name, uint8_t *p_data, uint32_t len, FILE *
 
 
 
-// return:   0 : success    1 : failed
-int writePNGImageFile (const char *p_filename, const uint8_t *p_buf, int is_rgb, uint32_t height, uint32_t width) {
-    size_t   w = (is_rgb?3:1)*width + 1;
-    uint32_t adler_a=1, adler_b=0;
-    size_t   i;
-    uint8_t *p_dst, *p, *p_last_blk;
-    FILE    *fp;
-    
+//--------------------------------------------------------------------------------------------------
+//  PNG row filters (http://www.libpng.org/pub/png/spec/1.2/PNG-Filters.html)
+//--------------------------------------------------------------------------------------------------
+static unsigned png_paeth (unsigned a, unsigned b, unsigned c) {
+    int p  = (int) a + (int) b - (int) c;
+    int pa = p - (int) a;  if (pa < 0) pa = -pa;
+    int pb = p - (int) b;  if (pb < 0) pb = -pb;
+    int pc = p - (int) c;  if (pc < 0) pc = -pc;
+    if (pa <= pb && pa <= pc) return a;
+    if (pb <= pc)            return b;
+    return c;
+}
+
+// The classic "smallest sum of absolute values" heuristic.  It is evaluated on a *sample* of the
+// row only: scoring every byte of a 7680 pixel line five times over is what makes libpng slow on
+// 8K frames, and sampling costs almost nothing in compression.
+static int png_pick_filter (const uint8_t *p_cur, const uint8_t *p_prev, size_t row, size_t bpp,
+                            int fmask, size_t step)
+{
+    unsigned long score[5] = { 0, 0, 0, 0, 0 };
+    size_t        i;
+    int           k, best = -1;
+    unsigned long bs = 0;
+
+    for (i=0; i<row; i+=step) {
+        unsigned a = (i >= bpp)          ? p_cur [i - bpp] : 0;
+        unsigned b = (p_prev)            ? p_prev[i]       : 0;
+        unsigned c = (p_prev && i>=bpp)  ? p_prev[i - bpp] : 0;
+        unsigned x = p_cur[i], f;
+        #define  SCORE(k, v)  do { f = (unsigned)((v) & 0xFF); \
+                                   score[k] += (f < 128) ? f : 256u - f; } while (0)
+        SCORE (0, x);
+        SCORE (1, x - a);
+        SCORE (2, x - b);
+        SCORE (3, x - ((a + b) >> 1));
+        SCORE (4, x - png_paeth (a, b, c));
+        #undef   SCORE
+    }
+    for (k=0; k<5; k++)
+        if ((fmask & (1 << k)) && (best < 0 || score[k] < bs)) { bs = score[k]; best = k; }
+    return (best < 0) ? 0 : best;
+}
+
+static void png_apply_filter (uint8_t *p_dst, const uint8_t *p_cur, const uint8_t *p_prev,
+                              size_t row, size_t bpp, int f)
+{
+    size_t i;
+    for (i=0; i<row; i++) {
+        unsigned a = (i >= bpp)         ? p_cur [i - bpp] : 0;
+        unsigned b = (p_prev)           ? p_prev[i]       : 0;
+        unsigned c = (p_prev && i>=bpp) ? p_prev[i - bpp] : 0;
+        unsigned x = p_cur[i];
+        switch (f) {
+            case 0:  p_dst[i] = (uint8_t) x;                       break;   // None
+            case 1:  p_dst[i] = (uint8_t)(x - a);                  break;   // Sub
+            case 2:  p_dst[i] = (uint8_t)(x - b);                  break;   // Up
+            case 3:  p_dst[i] = (uint8_t)(x - ((a + b) >> 1));     break;   // Average
+            default: p_dst[i] = (uint8_t)(x - png_paeth (a,b,c));  break;   // Paeth
+        }
+    }
+}
+
+// which filters a level is allowed to look at, and how densely the rows are sampled
+static int   png_filter_mask (int level) {
+    if (level <= 0) return 1;                                                     // None
+    if (level <= 3) return (1<<0) | (1<<2);                                       // None, Up
+    if (level <= 6) return (1<<0) | (1<<1) | (1<<2) | (1<<4);                     // + Sub, Paeth
+    return 0x1F;                                                                  // all five
+}
+static size_t png_filter_step (size_t bpp, int level) {
+    return bpp * ((level >= 7) ? 1u : 4u);
+}
+
+// the deflate output goes straight into IDAT chunks, one per call -- so the encoder never needs
+// more than its own ~700 KB, whatever the size of the image
+static void png_idat_sink (void *p_ctx, const void *p_data, size_t len) {
+    FILE *fp = (FILE*) p_ctx;
+    write_png_chunk ((char*) "IDAT", (uint8_t*) p_data, (uint32_t) len, fp);
+}
+
+//--------------------------------------------------------------------------------------------------
+//  write a PNG.   level 0 = stored (the old behaviour), 1..9 = deflate with the matching effort
+//  that zlib/libpng would use for that level.
+//
+//  return:   0 : success    1 : failed
+//--------------------------------------------------------------------------------------------------
+int writePNGImageFile (const char *p_filename, const uint8_t *p_buf, int is_rgb,
+                       uint32_t height, uint32_t width, int level)
+{
+    size_t      bpp, row, st_cap, st_len = 0;
+    uint8_t     ihdr[13];
+    uint8_t    *p_frow = NULL, *p_stage = NULL;
+    DeflateCtx *dc     = NULL;
+    FILE       *fp     = NULL;
+    uint32_t    y;
+    int         fmask, rc = 1;
+
     if (width < 1 || height < 1)
         return 1;
-    
-    p_dst = p = p_last_blk = (uint8_t*)malloc((w+6)*height + 65536);
-    if (p_dst == NULL)
-        return 1;
-    
-    if ((fp = mt_fopen(p_filename, "wb")) == NULL) {
-        free(p_dst);
-        return 1;
-    }
-    
-    fwrite("\x89PNG\r\n\32\n", sizeof(char), 8, fp);    // 8-bit PNG magic
-    
-    sprintf((char*)p_dst, "%c%c%c%c%c%c%c%c\x08%c%c%c%c", 
-        (uint8_t)( width>>24), (uint8_t)( width>>16), (uint8_t)( width>>8), (uint8_t)( width),
-        (uint8_t)(height>>24), (uint8_t)(height>>16), (uint8_t)(height>>8), (uint8_t)(height),
-        (is_rgb ? 2 : 0),
-        0, 0, 0
-    );
-    write_png_chunk((char*)"IHDR", p_dst, 13, fp);
-    
-    *p++ = 0x78;
-    *p++ = 0x01;
-    for (i=0; i<(w*height); i++) {
-        if (i%0xFFFF == 0) {
-            *p++ = 0;         // deflate block start (5bytes)
-            *p++ = 0xFF;
-            *p++ = 0xFF;
-            *p++ = 0x00;
-            *p++ = 0x00;
-            p_last_blk = p;
+    if (level < 0) level = 0;
+    if (level > 9) level = 9;
+
+    bpp    = (is_rgb ? 3 : 1);
+    row    = bpp * (size_t) width;
+    st_cap = row + 4096;
+
+    p_frow  = (uint8_t*) malloc (row);
+    p_stage = (uint8_t*) malloc (st_cap);
+    if (p_frow == NULL || p_stage == NULL) goto done;
+
+    fp = mt_fopen (p_filename, "wb");
+    if (fp == NULL) goto done;
+
+    dc = mt_deflate_new (level, png_idat_sink, fp);
+    if (dc == NULL) goto done;
+
+    fwrite ("\x89PNG\r\n\32\n", sizeof(char), 8, fp);          // 8-bit PNG magic
+
+    ihdr[0] = (uint8_t)( width>>24);  ihdr[1] = (uint8_t)( width>>16);
+    ihdr[2] = (uint8_t)( width>> 8);  ihdr[3] = (uint8_t)( width);
+    ihdr[4] = (uint8_t)(height>>24);  ihdr[5] = (uint8_t)(height>>16);
+    ihdr[6] = (uint8_t)(height>> 8);  ihdr[7] = (uint8_t)(height);
+    ihdr[8] = 8;                                                // bit depth
+    ihdr[9] = (uint8_t) (is_rgb ? 2 : 0);                       // colour type : truecolour / gray
+    ihdr[10] = 0;  ihdr[11] = 0;  ihdr[12] = 0;                 // deflate, filter 0, no interlace
+    write_png_chunk ((char*) "IHDR", ihdr, 13, fp);
+
+    fmask = png_filter_mask (level);
+    for (y=0; y<height; y++) {
+        const uint8_t *p_cur  = p_buf + (size_t) y * row;
+        const uint8_t *p_prev = (y == 0) ? NULL : (p_cur - row);
+        int            f      = (fmask == 1) ? 0
+                              : png_pick_filter (p_cur, p_prev, row, bpp, fmask,
+                                                 png_filter_step (bpp, level));
+        png_apply_filter (p_frow, p_cur, p_prev, row, bpp, f);
+
+        if (st_len + 1 + row > st_cap) {                        // hand the rows on in pieces
+            mt_deflate_write (dc, p_stage, st_len);
+            st_len = 0;
         }
-        if (i%w == 0) {
-            *p = 0;           // filter at each start of line
-        } else {
-            *p = *(p_buf++);  // pixel byte
-        }
-        adler_a = (adler_a + *p)      % 65521;
-        adler_b = (adler_b + adler_a) % 65521;
-        p ++;
+        p_stage[st_len++] = (uint8_t) f;
+        memcpy (p_stage + st_len, p_frow, row);
+        st_len += row;
     }
-    adler_a |= (adler_b << 16);
-    adler_b  = (p - p_last_blk);        // length of the last deflate block
-    p_last_blk[-5] = 1;
-    p_last_blk[-4] = (  adler_b    ) & 0xFF;
-    p_last_blk[-3] = (  adler_b >>8) & 0xFF;
-    p_last_blk[-2] = ((~adler_b)   ) & 0xFF;
-    p_last_blk[-1] = ((~adler_b)>>8) & 0xFF;
-    *p++ = (adler_a>>24) & 0xFF;
-    *p++ = (adler_a>>16) & 0xFF;
-    *p++ = (adler_a>> 8) & 0xFF;
-    *p++ = (adler_a    ) & 0xFF;
-    write_png_chunk((char*)"IDAT", p_dst, (size_t)(p-p_dst), fp);
-    
-    write_png_chunk((char*)"IEND", p_dst, 0, fp);
-    
-    free(p_dst);
-    fclose(fp);
-    return 0;
+    if (st_len) mt_deflate_write (dc, p_stage, st_len);
+    mt_deflate_end (dc);
+
+    write_png_chunk ((char*) "IEND", ihdr, 0, fp);
+    rc = 0;
+
+done:
+    if (dc)      mt_deflate_free (dc);
+    if (fp)      fclose (fp);
+    if (p_frow)  free (p_frow);
+    if (p_stage) free (p_stage);
+    return rc;
 }
 
 
